@@ -50,7 +50,7 @@ struct Tracked {
     std::shared_ptr<std::atomic<bool>> isShown = std::make_shared<std::atomic<bool>>(false);
     bool wasPlaying = false;
     bool canPrevious = false, canPlayPause = false, canNext = false;
-    bool canShuffle = false, shuffle = false, canRepeat = false;
+    bool canShuffle = false, shuffle = false, canRepeat = false, canSeek = false;
     RepeatMode repeat = RepeatMode::Off;
     double rate = 1.0;
     uint64_t playingSince = 0; // higher = started playing more recently
@@ -62,7 +62,7 @@ struct Tracked {
 // Reads play state and which buttons the app currently allows.
 void ReadPlayback(Tracked& t) {
     t.wasPlaying = t.canPrevious = t.canPlayPause = t.canNext = false;
-    t.canShuffle = t.shuffle = t.canRepeat = false;
+    t.canShuffle = t.shuffle = t.canRepeat = t.canSeek = false;
     t.repeat = RepeatMode::Off;
     t.rate = 1.0;
     try {
@@ -76,6 +76,7 @@ void ReadPlayback(Tracked& t) {
         if (auto rate = info.PlaybackRate(); rate && rate.Value() > 0) t.rate = rate.Value();
         t.canShuffle = controls.IsShuffleEnabled();
         t.canRepeat = controls.IsRepeatEnabled();
+        t.canSeek = controls.IsPlaybackPositionEnabled();
         if (auto shuffle = info.IsShuffleActive()) t.shuffle = shuffle.Value();
         if (auto repeat = info.AutoRepeatMode()) {
             using winrt::Windows::Media::MediaPlaybackAutoRepeatMode;
@@ -102,6 +103,7 @@ void ReadTimeline(const Session& session, MediaInfo& info) {
         info.durationMs = end - start;
         info.positionMs = std::clamp<int64_t>(position - start, 0, info.durationMs);
         info.reportedAt = winrt::clock::to_file_time(timeline.LastUpdatedTime()).value;
+        info.startMs = start;
     } catch (...) {
     }
 }
@@ -242,6 +244,11 @@ void MediaWatcher::Send(MediaCommand command) {
     SetEvent(wakeEvent_);
 }
 
+void MediaWatcher::SeekTo(int64_t positionMs) {
+    pendingSeekMs_ = std::max<int64_t>(positionMs, 0);
+    SetEvent(wakeEvent_);
+}
+
 void MediaWatcher::ShowSession(const std::wstring& appId) {
     {
         std::lock_guard lock(mutex_);
@@ -333,7 +340,7 @@ void MediaWatcher::Run() {
         HANDLE waits[] = {stopEvent_, wakeEvent_};
         while (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
             // A click or scroll should feel instant; only plain updates wait for the burst to settle.
-            if (pendingCommand_ == 0 && pendingSwitch_ == 0) {
+            if (pendingCommand_ == 0 && pendingSwitch_ == 0 && pendingSeekMs_ < 0) {
                 while (WaitForSingleObject(wakeEvent_, kCoalesceMs) == WAIT_OBJECT_0) {
                 }
             }
@@ -344,6 +351,14 @@ void MediaWatcher::Run() {
                 command != MediaCommand::None && shown) {
                 RunCommand(shown, command); // the app's update event re-wakes us with the new state
                 continue;
+            }
+            if (const int64_t seekMs = pendingSeekMs_.exchange(-1); seekMs >= 0 && shown) {
+                try {
+                    const int64_t ticks = (Latest().startMs + seekMs) * 10000; // the API counts 100 ns units
+                    shown.TryChangePlaybackPositionAsync(ticks).get();
+                } catch (...) {
+                }
+                continue; // the app reports its new timeline, which wakes us
             }
 
             if (!needsFullEvaluation_.exchange(false) && shown) {
@@ -504,6 +519,7 @@ void MediaWatcher::Run() {
                 info.canShuffle = best->canShuffle;
                 info.shuffle = best->shuffle;
                 info.canRepeat = best->canRepeat;
+                info.canSeek = best->canSeek;
                 info.repeat = best->repeat;
                 for (const auto& t : tracked) info.sessions.push_back({t.appId, t.appName, t.title, t.wasPlaying});
                 ReadTimeline(best->session, info);

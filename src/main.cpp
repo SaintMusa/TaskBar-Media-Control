@@ -46,7 +46,7 @@ enum : UINT_PTR {
     kTimerWheelRest,
     kTimerMarquee,
     kTimerSettingsReload,
-    kTimerVolumeShown,
+    kTimerFlash,
 };
 enum : UINT {
     kCmdExit = 1,
@@ -71,8 +71,9 @@ constexpr UINT kRelayoutDelayMs = 120; // coalesces bursts while icons animate
 constexpr UINT kAttachRetryMs = 1000;  // only while Explorer is (re)starting
 constexpr UINT kWheelRestMs = 300;     // wheel quiet this long = the scroll gesture ended
 constexpr UINT kSettingsSettleMs = 200; // editors save in several writes; reload once after
-constexpr UINT kVolumeShownMs = 1500;   // how long Ctrl+scroll shows the volume
+constexpr UINT kFlashMs = 1500;         // how long volume or seek feedback shows
 constexpr float kVolumeStep = 0.05f;    // per wheel notch
+constexpr int64_t kSeekStepMs = 5000;   // per wheel notch
 constexpr int kPreferredWidth = 300;   // all sizes in DIPs (96 DPI pixels)
 constexpr int kMinWidth = 160;
 constexpr int kMargin = 8;
@@ -162,7 +163,7 @@ struct State {
     int pressed = kNoButton;
     bool trackingMouse = false;
     bool wheelGesture = false; // a scroll is in progress and has already switched
-    int volumeShown = -1;      // percent shown after Ctrl+scroll; -1 none, 101 = no control
+    std::wstring flashText;    // shown on the artist line briefly, e.g. "Volume 45%"
     std::wstring volumeAppId;  // app whose exe volumeExe is
     std::wstring volumeExe;    // its audio exe, looked up once per app
     HWND tooltip = nullptr;
@@ -465,10 +466,8 @@ void DrawStatic(const WidgetLayout& layout, float w, float h) {
     const std::wstring title = media.appId.empty() ? L"Nothing playing"
                                : media.title.empty() ? L"Untitled"
                                                      : media.title;
-    // Right after Ctrl+scroll, the artist line briefly shows the app's volume instead.
-    const std::wstring artist = g.volumeShown < 0 ? media.artist
-                                : g.volumeShown > 100 ? L"No volume control for this app"
-                                                      : L"Volume " + std::to_wstring(g.volumeShown) + L"%";
+    // Right after Ctrl+ or Shift+scroll, the artist line briefly shows the volume or position.
+    const std::wstring artist = g.flashText.empty() ? media.artist : g.flashText;
     const auto& text = layout.text;
     g.overflowing.clear();
     if (artist.empty()) {
@@ -956,6 +955,13 @@ void OpenSettingsFile() {
     ShellExecuteW(nullptr, L"open", L"notepad.exe", (L"\"" + SettingsPath() + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
 }
 
+// Briefly shows a line of feedback in place of the artist.
+void Flash(const std::wstring& text) {
+    g.flashText = text;
+    SetTimer(g.controller, kTimerFlash, kFlashMs, nullptr);
+    Render();
+}
+
 // Ctrl+scroll: the playing app's own volume, 5% per notch, shown on the
 // artist line for a moment.
 void ChangeVolume(int wheelDelta) {
@@ -967,9 +973,36 @@ void ChangeVolume(int wheelDelta) {
     }
     const float step = kVolumeStep * wheelDelta / WHEEL_DELTA;
     const auto level = ChangeAppVolume(g.volumeExe, step);
-    g.volumeShown = level ? static_cast<int>(std::lround(*level * 100)) : 101;
-    SetTimer(g.controller, kTimerVolumeShown, kVolumeShownMs, nullptr);
-    Render();
+    Flash(level ? L"Volume " + std::to_wstring(std::lround(*level * 100)) + L"%" : L"No volume control for this app");
+}
+
+std::wstring FormatTime(int64_t ms) {
+    const int64_t total = ms / 1000;
+    wchar_t text[32];
+    if (total >= 3600) {
+        swprintf_s(text, L"%lld:%02lld:%02lld", total / 3600, total / 60 % 60, total % 60);
+    } else {
+        swprintf_s(text, L"%lld:%02lld", total / 60, total % 60);
+    }
+    return text;
+}
+
+// Shift+scroll: jump 5 s per notch, for apps that allow seeking. The bar moves
+// at once; the app's own timeline report confirms it a moment later.
+void Seek(int wheelDelta) {
+    MediaInfo& m = g.nowPlaying;
+    if (m.appId.empty()) return;
+    if (!m.canSeek || !m.hasTimeline) {
+        Flash(L"This app doesn't allow seeking");
+        return;
+    }
+    const int64_t now = NowFileTime();
+    const int64_t target =
+        std::clamp<int64_t>(m.PositionAt(now) - kSeekStepMs * wheelDelta / WHEEL_DELTA, 0, m.durationMs);
+    m.positionMs = target;
+    m.reportedAt = now;
+    g.media.SeekTo(target);
+    Flash(FormatTime(target) + L" / " + FormatTime(m.durationMs));
 }
 
 // Hovering shows the full title, artist and app, since long lines scroll or get cut.
@@ -1204,6 +1237,10 @@ LRESULT CALLBACK WidgetProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ChangeVolume(GET_WHEEL_DELTA_WPARAM(wp));
             return 0;
         }
+        if (GET_KEYSTATE_WPARAM(wp) & MK_SHIFT) {
+            Seek(GET_WHEEL_DELTA_WPARAM(wp)); // down = forward, like scrolling down a page
+            return 0;
+        }
         // One scroll gesture = one app, however many notches it has: switch on
         // the first notch, then ignore the wheel until it rests for a moment.
         // Down goes to the next session, up to the previous.
@@ -1284,8 +1321,8 @@ LRESULT CALLBACK ControllerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g.wheelGesture = false;
         } else if (wp == kTimerMarquee) {
             OnMarqueeTick();
-        } else if (wp == kTimerVolumeShown) {
-            g.volumeShown = -1;
+        } else if (wp == kTimerFlash) {
+            g.flashText.clear();
             Render();
         } else if (wp == kTimerSettingsReload) {
             if (Settings next = LoadSettings(); !(next == g.settings)) {
@@ -1322,7 +1359,7 @@ LRESULT CALLBACK ControllerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 average(g.marqueeTicks, g.marqueeRenders), average(g.presentTicks, total));
         }
         for (UINT_PTR timer : {kTimerRelayout, kTimerAttachRetry, kTimerProgress, kTimerIdleHide, kTimerWheelRest,
-                               kTimerMarquee, kTimerSettingsReload, kTimerVolumeShown}) {
+                               kTimerMarquee, kTimerSettingsReload, kTimerFlash}) {
             KillTimer(hwnd, timer);
         }
         UnregisterAppBar();

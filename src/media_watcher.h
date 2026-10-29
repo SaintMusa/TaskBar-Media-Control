@@ -54,6 +54,8 @@ struct MediaInfo {
     int64_t durationMs = 0;
     int64_t positionMs = 0;
     int64_t reportedAt = 0; // FILETIME units (100 ns since 1601), 0 if unknown
+    int64_t startMs = 0;    // the timeline's own start; positionMs counts from here
+    bool canSeek = false;   // the app lets others change the position
     double rate = 1.0;
 
     // Playback position in ms at `now` (a FILETIME value).
@@ -98,6 +100,8 @@ public:
     void Send(MediaCommand command);
     // Shows the next (+1) or previous (-1) media session. Returns immediately.
     void SwitchSession(int direction);
+    // Jumps the shown session to this position (ms from the start of the track).
+    void SeekTo(int64_t positionMs);
     // Shows this app's session, as a manual pick (like SwitchSession).
     void ShowSession(const std::wstring& appId);
     // Applies new ignore/browser rules and re-picks the shown session.
@@ -121,6 +125,7 @@ private:
     std::atomic<bool> needsFullEvaluation_{true};
     std::atomic<int> pendingCommand_{0};
     std::atomic<int> pendingSwitch_{0};
+    std::atomic<int64_t> pendingSeekMs_{-1}; // -1 = no seek waiting
     std::atomic<UINT> artSize_{32};
     HWND notifyWnd_ = nullptr;
     UINT changedMsg_ = 0;
