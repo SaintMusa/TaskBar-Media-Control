@@ -34,12 +34,13 @@ enum : UINT {
     WM_APP_MEDIA,                 // what's playing changed
     WM_APP_APPBAR,                // shell notifications (full screen apps)
 };
-enum : UINT_PTR { kTimerRelayout = 1, kTimerAttachRetry, kTimerProgress, kTimerIdleHide };
+enum : UINT_PTR { kTimerRelayout = 1, kTimerAttachRetry, kTimerProgress, kTimerIdleHide, kTimerWheelRest, kTimerMarquee };
 enum : UINT { kCmdExit = 1 };
 
 constexpr UINT kRelayoutDelayMs = 120; // coalesces bursts while icons animate
 constexpr UINT kAttachRetryMs = 1000;  // only while Explorer is (re)starting
 constexpr UINT kIdleHideMs = 30000;    // paused this long: get out of the way
+constexpr UINT kWheelRestMs = 300;     // wheel quiet this long = the scroll gesture ended
 constexpr int kPreferredWidth = 300;   // all sizes in DIPs (96 DPI pixels)
 constexpr int kMinWidth = 160;
 constexpr int kMargin = 8;
@@ -50,6 +51,10 @@ constexpr int kGap = 8;                // art to text, text to buttons
 constexpr int kButtonWidth = 28;
 constexpr int kArtRadius = 4;
 constexpr int kSeekbarThickness = 3;
+constexpr UINT kMarqueePauseMs = 2000; // long text rests this long at each end
+constexpr int kMarqueeSpeed = 30;      // DIPs per second
+constexpr UINT kMarqueeFrameMs = 33;   // ~30 fps, only while text is actually moving
+constexpr int kMarqueeFade = 12;       // DIPs of fade where text runs past the edge
 constexpr float kTitleFontSize = 12.0f;
 constexpr float kArtistFontSize = 11.0f;
 constexpr float kIconFontSize = 14.0f;
@@ -71,6 +76,31 @@ struct WidgetLayout {
     D2D1_RECT_F text;
     D2D1_RECT_F buttons[kButtonCount];
     D2D1_RECT_F seekbar;
+};
+
+// A line of text too long for its space, found while drawing.
+struct OverflowLine {
+    std::wstring text;
+    ComPtr<IDWriteTextLayout> layout;
+    D2D1_RECT_F rect;
+    D2D1_COLOR_F color;
+    float width;
+};
+
+// That line rendered once into its own pixels. Scrolling then only copies
+// pixels at a new offset: no text layout or Direct2D work per frame.
+struct Marquee {
+    std::vector<uint32_t> pixels; // premultiplied BGRA, stripW x stripH
+    int stripW = 0;
+    int stripH = 0;
+    RECT view{};    // where it shows inside the widget
+    int travel = 0; // how far it slides: stripW minus the view's width
+};
+
+enum class Redraw {
+    Full,    // something real changed: redraw everything
+    Seekbar, // the bar moved a pixel: reuse the static parts
+    Marquee, // long text slid: reuse everything, just move the text strips
 };
 
 struct State {
@@ -98,7 +128,7 @@ struct State {
     int hovered = kNoButton;
     int pressed = kNoButton;
     bool trackingMouse = false;
-    int wheelDelta = 0; // leftover from high-resolution wheels and touchpads
+    bool wheelGesture = false; // a scroll is in progress and has already switched
 
     bool fits = false;       // the taskbar has room for us
     bool fullscreen = false; // a full screen app or game is in front
@@ -109,7 +139,13 @@ struct State {
     HGDIOBJ oldBitmap = nullptr;
     void* dibBits = nullptr;
     SIZE bitmapSize{};
-    std::vector<BYTE> staticPixels; // last full draw minus the seekbar
+    std::vector<BYTE> staticPixels; // last full draw minus the seekbar and scrolling text
+    std::vector<BYTE> basePixels;   // staticPixels plus the seekbar
+    std::vector<OverflowLine> overflowing;
+    std::vector<Marquee> marquees;
+    std::wstring marqueeKey;        // the scrolling texts; a change restarts the cycle
+    ULONGLONG marqueeStart = 0;
+    bool marqueeRunning = false;
     ComPtr<ID2D1RoundedRectangleGeometry> boxClip;
     D2D1_SIZE_F boxClipSize{};
     ComPtr<ID2D1Layer> clipLayer;
@@ -122,8 +158,10 @@ struct State {
     unsigned layoutEvents = 0;
     unsigned renders = 0;        // for measuring: count and time spent drawing
     unsigned seekbarRenders = 0; // the cheap seekbar-only kind
+    unsigned marqueeRenders = 0; // the cheapest: scrolling text frames
     int64_t drawTicks = 0;       // Direct2D, QueryPerformanceCounter units
     int64_t seekbarTicks = 0;
+    int64_t marqueeTicks = 0;
     int64_t presentTicks = 0;    // UpdateLayeredWindow
 } g;
 
@@ -317,6 +355,23 @@ D2D1_COLOR_F InkAt(float alpha) {
     return g.lightTheme ? D2D1::ColorF(0, 0, 0, alpha) : D2D1::ColorF(1, 1, 1, alpha);
 }
 
+// Draws a line of text that fits. One that doesn't is left out and queued in
+// g.overflowing, to be drawn as a scrolling strip instead.
+void DrawLine(const std::wstring& text, IDWriteTextFormat* format, D2D1_RECT_F rect, ID2D1SolidColorBrush* ink) {
+    ComPtr<IDWriteTextLayout> layout;
+    DWRITE_TEXT_METRICS metrics{};
+    if (FAILED(g.dwrite->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.size()), format, 100000.0f,
+                                          rect.bottom - rect.top, &layout)) ||
+        FAILED(layout->GetMetrics(&metrics))) {
+        return;
+    }
+    if (metrics.width <= rect.right - rect.left) {
+        g.target->DrawTextLayout(D2D1::Point2F(rect.left, rect.top), layout.Get(), ink, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        return;
+    }
+    g.overflowing.push_back({text, layout, rect, ink->GetColor(), metrics.width});
+}
+
 // Box, art, text and buttons: everything except the seekbar.
 void DrawStatic(const WidgetLayout& layout, float w, float h) {
     const MediaInfo& media = g.nowPlaying;
@@ -361,20 +416,17 @@ void DrawStatic(const WidgetLayout& layout, float w, float h) {
         g.target->DrawBitmap(icon, badge, media.playing ? 1.0f : 0.7f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
     }
 
-    const std::wstring& title = media.appId.empty() ? std::wstring(L"Nothing playing")
-                                : media.title.empty() ? std::wstring(L"Untitled")
-                                                      : media.title;
+    const std::wstring title = media.appId.empty() ? L"Nothing playing"
+                               : media.title.empty() ? L"Untitled"
+                                                     : media.title;
     const auto& text = layout.text;
+    g.overflowing.clear();
     if (media.artist.empty()) {
-        g.target->DrawTextW(title.c_str(), static_cast<UINT32>(title.size()), g.titleFormat.Get(), text,
-                            titleInk.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        DrawLine(title, g.titleFormat.Get(), text, titleInk.Get());
     } else {
-        g.target->DrawTextW(title.c_str(), static_cast<UINT32>(title.size()), g.titleFormat.Get(),
-                            D2D1::RectF(text.left, h * 0.08f, text.right, h * 0.54f), titleInk.Get(),
-                            D2D1_DRAW_TEXT_OPTIONS_CLIP);
-        g.target->DrawTextW(media.artist.c_str(), static_cast<UINT32>(media.artist.size()), g.artistFormat.Get(),
-                            D2D1::RectF(text.left, h * 0.5f, text.right, h * 0.92f), artistInk.Get(),
-                            D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        DrawLine(title, g.titleFormat.Get(), D2D1::RectF(text.left, h * 0.08f, text.right, h * 0.54f), titleInk.Get());
+        DrawLine(media.artist, g.artistFormat.Get(), D2D1::RectF(text.left, h * 0.5f, text.right, h * 0.92f),
+                 artistInk.Get());
     }
 
     // Buttons: a soft highlight on hover, dimmer while pressed, faint when the app disallows them.
@@ -424,9 +476,144 @@ void DrawSeekbar(const WidgetLayout& layout, float w, float h) {
     g.target->PopLayer();
 }
 
-// Draws and presents the widget. The static parts are kept in a copy, so a
-// seekbar tick (seekbarOnly) pastes that copy and draws just the bar.
-void Render(bool seekbarOnly = false) {
+// Renders each overflowing line once into its own strip of pixels.
+void BuildMarquees() {
+    std::wstring key;
+    for (const auto& line : g.overflowing) key += line.text + L'\n';
+    if (key != g.marqueeKey) {
+        g.marqueeKey = key;
+        g.marqueeStart = GetTickCount64(); // new text starts from the beginning
+    }
+    g.marquees.clear();
+    for (const auto& line : g.overflowing) {
+        Marquee m;
+        m.view = {static_cast<LONG>(std::ceil(line.rect.left)), static_cast<LONG>(std::floor(line.rect.top)),
+                  static_cast<LONG>(std::floor(line.rect.right)), static_cast<LONG>(std::ceil(line.rect.bottom))};
+        m.stripW = static_cast<int>(std::ceil(line.width)) + 2;
+        m.stripH = m.view.bottom - m.view.top;
+        m.travel = m.stripW - (m.view.right - m.view.left);
+        if (m.stripH <= 0 || m.travel <= 0) continue;
+
+        BITMAPINFO info{};
+        info.bmiHeader = {sizeof(info.bmiHeader), m.stripW, -m.stripH, 1, 32, BI_RGB};
+        void* bits = nullptr;
+        HDC dc = CreateCompatibleDC(nullptr);
+        HBITMAP strip = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+        HGDIOBJ old = strip ? SelectObject(dc, strip) : nullptr;
+        RECT bounds{0, 0, m.stripW, m.stripH};
+        ComPtr<ID2D1SolidColorBrush> ink;
+        if (strip && SUCCEEDED(g.target->BindDC(dc, &bounds)) &&
+            SUCCEEDED(g.target->CreateSolidColorBrush(line.color, &ink))) {
+            g.target->BeginDraw();
+            g.target->Clear(D2D1::ColorF(0, 0, 0, 0));
+            g.target->DrawTextLayout(D2D1::Point2F(0, line.rect.top - m.view.top), line.layout.Get(), ink.Get());
+            if (SUCCEEDED(g.target->EndDraw())) {
+                GdiFlush();
+                const auto* px = static_cast<const uint32_t*>(bits);
+                m.pixels.assign(px, px + static_cast<size_t>(m.stripW) * m.stripH);
+                g.marquees.push_back(std::move(m));
+            }
+        }
+        if (old) SelectObject(dc, old);
+        if (strip) DeleteObject(strip);
+        DeleteDC(dc);
+    }
+}
+
+// Back and forth: rest, slide to the end, rest, slide back. Also reports how
+// long until the next frame is needed (0 = it's sliding, so draw soon).
+int MarqueeOffset(const Marquee& m, ULONGLONG elapsed, ULONGLONG* wait) {
+    const double pxPerMs = Scale(kMarqueeSpeed) / 1000.0;
+    const ULONGLONG slide = static_cast<ULONGLONG>(m.travel / pxPerMs);
+    ULONGLONG t = elapsed % (2 * (kMarqueePauseMs + slide));
+    *wait = 0;
+    if (t < kMarqueePauseMs) {
+        *wait = kMarqueePauseMs - t;
+        return 0;
+    }
+    t -= kMarqueePauseMs;
+    if (t < slide) return static_cast<int>(t * pxPerMs);
+    t -= slide;
+    if (t < kMarqueePauseMs) {
+        *wait = kMarqueePauseMs - t;
+        return m.travel;
+    }
+    t -= kMarqueePauseMs;
+    return m.travel - static_cast<int>(t * pxPerMs);
+}
+
+// Premultiplied "source over destination" for one BGRA pixel.
+uint32_t Over(uint32_t s, uint32_t d) {
+    const uint32_t keep = 255 - (s >> 24);
+    uint32_t out = 0;
+    for (int shift = 0; shift < 32; shift += 8) {
+        const uint32_t c = ((s >> shift) & 255) + (((d >> shift) & 255) * keep + 127) / 255;
+        out |= std::min<uint32_t>(c, 255) << shift;
+    }
+    return out;
+}
+
+uint32_t Faded(uint32_t s, int coverage /* 0..256 */) {
+    uint32_t out = 0;
+    for (int shift = 0; shift < 32; shift += 8) out |= (((s >> shift) & 255) * coverage >> 8) << shift;
+    return out;
+}
+
+// Copies each strip into the frame at its current offset, fading the edge
+// where the text continues out of view.
+void BlendMarquees() {
+    auto* frame = static_cast<uint32_t*>(g.dibBits);
+    const int stride = g.bitmapSize.cx;
+    const int fade = std::max(1, Scale(kMarqueeFade));
+    const ULONGLONG elapsed = GetTickCount64() - g.marqueeStart;
+    for (const auto& m : g.marquees) {
+        ULONGLONG wait;
+        const int offset = g.marqueeRunning ? MarqueeOffset(m, elapsed, &wait) : 0;
+        const int viewW = m.view.right - m.view.left;
+        for (int y = 0; y < m.stripH; ++y) {
+            const int fy = m.view.top + y;
+            if (fy < 0 || fy >= g.bitmapSize.cy) continue;
+            for (int x = 0; x < viewW && x + offset < m.stripW; ++x) {
+                uint32_t s = m.pixels[static_cast<size_t>(y) * m.stripW + x + offset];
+                if (!s) continue;
+                int coverage = 256;
+                if (offset > 0 && x < fade) coverage = coverage * x / fade;
+                if (offset < m.travel && x >= viewW - fade) coverage = coverage * (viewW - 1 - x) / fade;
+                if (coverage < 256) s = Faded(s, coverage);
+                uint32_t& d = frame[static_cast<size_t>(fy) * stride + m.view.left + x];
+                d = Over(s, d);
+            }
+        }
+    }
+}
+
+// Ticks only while long text is actually sliding; during the rests at each
+// end it sleeps until the next slide. Stopped while paused, hidden or full screen.
+void ScheduleMarquee() {
+    KillTimer(g.controller, kTimerMarquee);
+    const bool run = g.widget && IsWindowVisible(g.widget) && g.nowPlaying.playing && !g.fullscreen &&
+                     !g.marquees.empty();
+    if (!run) {
+        g.marqueeRunning = false;
+        return;
+    }
+    if (!g.marqueeRunning) {
+        g.marqueeRunning = true;
+        g.marqueeStart = GetTickCount64();
+    }
+    ULONGLONG next = ~0ULL;
+    const ULONGLONG elapsed = GetTickCount64() - g.marqueeStart;
+    for (const auto& m : g.marquees) {
+        ULONGLONG wait;
+        MarqueeOffset(m, elapsed, &wait);
+        next = std::min(next, wait == 0 ? kMarqueeFrameMs : wait);
+    }
+    SetTimer(g.controller, kTimerMarquee, static_cast<UINT>(std::max<ULONGLONG>(next, kMarqueeFrameMs)), nullptr);
+}
+
+// Draws and presents the widget, reusing as much of the last frame as `what`
+// allows: the static parts are kept, then the seekbar on top of them.
+void Render(Redraw what = Redraw::Full) {
     if (!g.widget || !IsWindowVisible(g.widget)) return;
     SIZE size{g.placed.right - g.placed.left, g.placed.bottom - g.placed.top};
     if (size.cx <= 0 || size.cy <= 0 || !EnsureGraphics() || !EnsureBitmap(size)) return;
@@ -434,26 +621,36 @@ void Render(bool seekbarOnly = false) {
     QueryPerformanceCounter(&t0);
 
     RECT bounds{0, 0, size.cx, size.cy};
-    if (FAILED(g.target->BindDC(g.memDC, &bounds))) return;
     const float w = static_cast<float>(size.cx), h = static_cast<float>(size.cy);
     const WidgetLayout layout = ComputeLayout(w, h);
     const size_t bytes = static_cast<size_t>(size.cx) * size.cy * 4;
+    auto* bits = static_cast<BYTE*>(g.dibBits);
+    if (g.staticPixels.size() != bytes) what = Redraw::Full;
+    if (what == Redraw::Marquee && g.basePixels.size() != bytes) what = Redraw::Seekbar;
+    const Redraw measured = what;
 
     HRESULT hr = S_OK;
-    if (seekbarOnly && g.staticPixels.size() == bytes) {
-        memcpy(g.dibBits, g.staticPixels.data(), bytes);
-    } else {
+    if (what == Redraw::Full) {
+        if (FAILED(g.target->BindDC(g.memDC, &bounds))) return;
         g.target->BeginDraw();
         DrawStatic(layout, w, h);
         hr = g.target->EndDraw();
         GdiFlush();
-        const auto* bits = static_cast<const BYTE*>(g.dibBits);
         g.staticPixels.assign(bits, bits + bytes);
+        if (SUCCEEDED(hr)) BuildMarquees(); // borrows the render target, so rebind below
+    } else if (what == Redraw::Seekbar) {
+        memcpy(bits, g.staticPixels.data(), bytes);
     }
-    if (SUCCEEDED(hr) && g.nowPlaying.hasTimeline) {
-        g.target->BeginDraw();
-        DrawSeekbar(layout, w, h);
-        hr = g.target->EndDraw();
+    if (SUCCEEDED(hr) && what != Redraw::Marquee) {
+        if (g.nowPlaying.hasTimeline && SUCCEEDED(g.target->BindDC(g.memDC, &bounds))) {
+            g.target->BeginDraw();
+            DrawSeekbar(layout, w, h);
+            hr = g.target->EndDraw();
+            GdiFlush();
+        }
+        g.basePixels.assign(bits, bits + bytes);
+    } else if (what == Redraw::Marquee) {
+        memcpy(bits, g.basePixels.data(), bytes);
     }
     if (hr == D2DERR_RECREATE_TARGET) {
         // These belong to the target; rebuild them on the next draw.
@@ -464,8 +661,10 @@ void Render(bool seekbarOnly = false) {
         g.iconBitmap.Reset();
         g.iconBitmapSource = nullptr;
         g.staticPixels.clear();
+        g.basePixels.clear();
         return;
     }
+    BlendMarquees();
 
     QueryPerformanceCounter(&t1);
     POINT source{0, 0};
@@ -474,9 +673,19 @@ void Render(bool seekbarOnly = false) {
         Log(L"UpdateLayeredWindow failed: %lu", GetLastError());
     }
     QueryPerformanceCounter(&t2);
-    ++(seekbarOnly ? g.seekbarRenders : g.renders);
-    (seekbarOnly ? g.seekbarTicks : g.drawTicks) += t1.QuadPart - t0.QuadPart;
+    const int64_t spent = t1.QuadPart - t0.QuadPart;
+    switch (measured) {
+    case Redraw::Full: ++g.renders, g.drawTicks += spent; break;
+    case Redraw::Seekbar: ++g.seekbarRenders, g.seekbarTicks += spent; break;
+    case Redraw::Marquee: ++g.marqueeRenders, g.marqueeTicks += spent; break;
+    }
     g.presentTicks += t2.QuadPart - t1.QuadPart;
+    if (measured != Redraw::Marquee) ScheduleMarquee();
+}
+
+void OnMarqueeTick() {
+    Render(Redraw::Marquee);
+    ScheduleMarquee();
 }
 
 // ---------------------------------------------------------------------------
@@ -573,6 +782,7 @@ void UpdateVisibility() {
         if (show) Render();
     }
     ScheduleProgress();
+    ScheduleMarquee();
 }
 
 // Free space on a centered taskbar: between the left edge (or the Widgets
@@ -656,7 +866,7 @@ void OnMediaChanged() {
     MediaInfo sameTimeline = m;
     sameTimeline.positionMs = previous.positionMs;
     sameTimeline.reportedAt = previous.reportedAt;
-    Render(/*seekbarOnly=*/sameTimeline == previous);
+    Render(sameTimeline == previous ? Redraw::Seekbar : Redraw::Full);
 }
 
 void ShowMenu() {
@@ -729,13 +939,14 @@ LRESULT CALLBACK WidgetProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     case WM_MOUSEWHEEL:
-        // One notch = one app. Down goes to the next session, up to the previous.
-        g.wheelDelta += GET_WHEEL_DELTA_WPARAM(wp);
-        while (std::abs(g.wheelDelta) >= WHEEL_DELTA) {
-            const int direction = g.wheelDelta > 0 ? -1 : 1;
-            g.media.SwitchSession(direction);
-            g.wheelDelta += direction * WHEEL_DELTA;
+        // One scroll gesture = one app, however many notches it has: switch on
+        // the first notch, then ignore the wheel until it rests for a moment.
+        // Down goes to the next session, up to the previous.
+        if (!g.wheelGesture) {
+            g.wheelGesture = true;
+            g.media.SwitchSession(GET_WHEEL_DELTA_WPARAM(wp) > 0 ? -1 : 1);
         }
+        SetTimer(g.controller, kTimerWheelRest, kWheelRestMs, nullptr); // re-armed while scrolling continues
         return 0;
     case WM_RBUTTONUP:
         ShowMenu();
@@ -779,6 +990,7 @@ LRESULT CALLBACK ControllerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             Log(L"Full screen notification: %s (%s)", lp ? L"opened" : L"closed",
                 g.fullscreen ? L"confirmed" : L"not covering the taskbar");
             ScheduleProgress();
+            ScheduleMarquee();
         }
         return 0;
     case WM_APP_TASKBAR_CHANGED:
@@ -798,11 +1010,15 @@ LRESULT CALLBACK ControllerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (wp == kTimerAttachRetry) {
             Attach();
         } else if (wp == kTimerProgress) {
-            Render(/*seekbarOnly=*/true);
+            Render(Redraw::Seekbar);
             ScheduleProgress();
         } else if (wp == kTimerIdleHide) {
             g.idleHidden = true;
             UpdateVisibility();
+        } else if (wp == kTimerWheelRest) {
+            g.wheelGesture = false;
+        } else if (wp == kTimerMarquee) {
+            OnMarqueeTick();
         }
         return 0;
     case WM_SETTINGCHANGE:
@@ -822,16 +1038,18 @@ LRESULT CALLBACK ControllerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DESTROY:
         Log(L"Exiting (%u layout events, %u media evaluations, %u of them timeline-only)", g.layoutEvents,
             g.media.Evaluations(), g.media.TimelineOnlyEvaluations());
-        if (g.renders + g.seekbarRenders) {
+        if (const unsigned total = g.renders + g.seekbarRenders + g.marqueeRenders) {
             LARGE_INTEGER freq;
             QueryPerformanceFrequency(&freq);
             const double ms = 1000.0 / freq.QuadPart;
-            Log(L"%u full renders at %.2f ms, %u seekbar-only at %.2f ms, presenting %.2f ms on average", g.renders,
-                g.renders ? ms * g.drawTicks / g.renders : 0.0, g.seekbarRenders,
-                g.seekbarRenders ? ms * g.seekbarTicks / g.seekbarRenders : 0.0,
-                ms * g.presentTicks / (g.renders + g.seekbarRenders));
+            auto average = [&](int64_t ticks, unsigned count) { return count ? ms * ticks / count : 0.0; };
+            Log(L"Renders: %u full at %.2f ms, %u seekbar at %.2f ms, %u marquee at %.3f ms; presenting %.2f ms",
+                g.renders, average(g.drawTicks, g.renders), g.seekbarRenders,
+                average(g.seekbarTicks, g.seekbarRenders), g.marqueeRenders,
+                average(g.marqueeTicks, g.marqueeRenders), average(g.presentTicks, total));
         }
-        for (UINT_PTR timer : {kTimerRelayout, kTimerAttachRetry, kTimerProgress, kTimerIdleHide}) {
+        for (UINT_PTR timer :
+             {kTimerRelayout, kTimerAttachRetry, kTimerProgress, kTimerIdleHide, kTimerWheelRest, kTimerMarquee}) {
             KillTimer(hwnd, timer);
         }
         UnregisterAppBar();
