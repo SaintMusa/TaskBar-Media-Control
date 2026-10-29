@@ -1167,7 +1167,7 @@ void Seek(int wheelDelta) {
     }
     const int64_t now = NowFileTime();
     const int64_t target =
-        std::clamp<int64_t>(m.PositionAt(now) - kSeekStepMs * wheelDelta / WHEEL_DELTA, 0, m.durationMs);
+        std::clamp<int64_t>(m.PositionAt(now) + kSeekStepMs * wheelDelta / WHEEL_DELTA, 0, m.durationMs);
     m.positionMs = target;
     m.reportedAt = now;
     g.media.SeekTo(target);
@@ -1407,7 +1407,7 @@ LRESULT CALLBACK WidgetProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (GET_KEYSTATE_WPARAM(wp) & MK_SHIFT) {
-            Seek(GET_WHEEL_DELTA_WPARAM(wp)); // down = forward, like scrolling down a page
+            Seek(GET_WHEEL_DELTA_WPARAM(wp)); // up = forward, down = back (like volume: up is more)
             return 0;
         }
         // One scroll gesture = one app, however many notches it has: switch on
