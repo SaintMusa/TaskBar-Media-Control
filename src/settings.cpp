@@ -66,15 +66,45 @@ std::wstring JoinList(const std::vector<std::wstring>& items) {
 
 } // namespace
 
+std::wstring AppDataSettingsPath() {
+    PWSTR appData = nullptr;
+    std::wstring dir;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appData))) dir = appData;
+    CoTaskMemFree(appData);
+    return dir + L"\\TaskbarMedia\\settings.ini";
+}
+
+// Whether we may create files in this folder (Program Files, for one, says no).
+bool CanWriteTo(const std::wstring& dir) {
+    HANDLE probe = CreateFileW((dir + L"\\.taskbarmedia-write-test").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    if (probe == INVALID_HANDLE_VALUE) return false;
+    CloseHandle(probe);
+    return true;
+}
+
+// Next to the exe, like a portable app, so it's easy to find and opens in any
+// editor. (The Store version of Notepad can't open files in AppData folders
+// made by other apps.) Falls back to AppData where the exe's folder is read-only.
 std::wstring SettingsPath() {
     static const std::wstring path = [] {
-        PWSTR appData = nullptr;
-        std::wstring dir;
-        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appData))) dir = appData;
-        CoTaskMemFree(appData);
-        dir += L"\\TaskbarMedia";
-        CreateDirectoryW(dir.c_str(), nullptr);
-        return dir + L"\\settings.ini";
+        wchar_t exe[MAX_PATH];
+        const DWORD length = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring dir(exe, length > 0 && length < MAX_PATH ? length : 0);
+        dir = dir.substr(0, dir.find_last_of(L'\\'));
+        if (!dir.empty() && CanWriteTo(dir)) {
+            const std::wstring portable = dir + L"\\settings.ini";
+            // Earlier versions kept the file in AppData; bring it along once.
+            const std::wstring old = AppDataSettingsPath();
+            if (GetFileAttributesW(portable.c_str()) == INVALID_FILE_ATTRIBUTES &&
+                GetFileAttributesW(old.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                CopyFileW(old.c_str(), portable.c_str(), TRUE);
+            }
+            return portable;
+        }
+        const std::wstring fallback = AppDataSettingsPath();
+        CreateDirectoryW(fallback.substr(0, fallback.find_last_of(L'\\')).c_str(), nullptr);
+        return fallback;
     }();
     return path;
 }

@@ -1376,11 +1376,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     Attach();
 
     // Windows signals this handle when the settings folder changes, so hand
-    // edits apply on save without polling the file.
+    // edits apply on save without polling the file. The folder also holds the
+    // log, so only a new write time on settings.ini itself leads to a reload.
     const std::wstring settingsPath = SettingsPath();
     HANDLE settingsChanged = FindFirstChangeNotificationW(
         settingsPath.substr(0, settingsPath.find_last_of(L'\\')).c_str(), FALSE, FILE_NOTIFY_CHANGE_LAST_WRITE);
     if (settingsChanged == INVALID_HANDLE_VALUE) settingsChanged = nullptr;
+    auto settingsWriteTime = [&] {
+        WIN32_FILE_ATTRIBUTE_DATA data{};
+        GetFileAttributesExW(settingsPath.c_str(), GetFileExInfoStandard, &data);
+        return (static_cast<uint64_t>(data.ftLastWriteTime.dwHighDateTime) << 32) | data.ftLastWriteTime.dwLowDateTime;
+    };
+    uint64_t settingsWritten = settingsWriteTime();
 
     MSG msg;
     for (bool running = true; running;) {
@@ -1388,7 +1395,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
                                                        QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         if (settingsChanged && woke == WAIT_OBJECT_0) {
             FindNextChangeNotification(settingsChanged);
-            SetTimer(g.controller, kTimerSettingsReload, kSettingsSettleMs, nullptr);
+            if (const uint64_t written = settingsWriteTime(); written != settingsWritten) {
+                settingsWritten = written;
+                SetTimer(g.controller, kTimerSettingsReload, kSettingsSettleMs, nullptr);
+            }
             continue;
         }
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {

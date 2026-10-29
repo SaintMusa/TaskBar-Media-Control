@@ -3,9 +3,10 @@
 #include <string>
 #include <vector>
 
-// User settings, kept in %APPDATA%\TaskbarMedia\settings.ini. The file is
-// plain text with a comment on every setting, so it can be edited by hand;
-// the app watches it and applies changes as soon as it's saved.
+// User settings, kept in settings.ini next to TaskbarMedia.exe (or in
+// %APPDATA%\TaskbarMedia when that folder isn't writable). The file is plain
+// text with a comment on every setting, so it can be edited by hand; the app
+// watches it and applies changes as soon as it's saved.
 struct Settings {
     // Keep showing the last track while paused instead of hiding after a delay.
     bool stayVisibleWhenPaused = false;

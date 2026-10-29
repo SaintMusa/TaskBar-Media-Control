@@ -58,9 +58,10 @@ to install.
 
 ## Settings
 
-Settings are in `%APPDATA%\TaskbarMedia\settings.ini` (right-click >
-**Open settings file**). Every setting has a comment, and changes apply as
-soon as you save the file.
+Settings are in `settings.ini` next to `TaskbarMedia.exe` (right-click >
+**Open settings file**). If that folder can't be written to, for example in
+Program Files, they go to `%APPDATA%\TaskbarMedia\settings.ini` instead. Every
+setting has a comment, and changes apply as soon as you save the file.
 
 | Setting | What it does |
 |---|---|
