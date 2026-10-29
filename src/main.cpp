@@ -21,6 +21,7 @@
 #include <vector>
 #include "app_info.h"
 #include "media_watcher.h"
+#include "popup.h"
 #include "settings.h"
 #include "taskbar_watcher.h"
 #include "volume.h"
@@ -76,6 +77,7 @@ constexpr UINT kFlashMs = 1500;         // how long volume or seek feedback show
 constexpr float kVolumeStep = 0.05f;    // per wheel notch
 constexpr int64_t kSeekStepMs = 5000;   // per wheel notch
 constexpr ULONGLONG kFadeMs = 220;      // cross-fade between tracks
+constexpr ULONGLONG kPopupReopenGuardMs = 300;
 constexpr UINT kFadeFrameMs = 15;       // only while a fade is running
 constexpr int kPreferredWidth = 300;   // all sizes in DIPs (96 DPI pixels)
 constexpr int kMinWidth = 160;
@@ -108,7 +110,7 @@ constexpr wchar_t kGlyphSwitchApp = 0xE76C; // chevron, like Windows' own media 
 
 // kButtonSwitchApp only exists while two or more apps have media.
 enum Button { kButtonPrevious, kButtonPlayPause, kButtonNext, kButtonSwitchApp, kButtonCount, kNoButton = -1 };
-constexpr int kPressedArt = 100; // g.pressed value while the cover art is held down
+constexpr int kPressedBody = 100; // g.pressed value while the widget is held down outside its buttons
 
 struct WidgetLayout {
     D2D1_RECT_F art;
@@ -387,13 +389,6 @@ bool ButtonEnabled(int button) {
     case kButtonSwitchApp: return g.nowPlaying.sessionCount > 1;
     }
     return false;
-}
-
-bool HitArt(POINT pt) {
-    const float w = static_cast<float>(g.placed.right - g.placed.left);
-    const float h = static_cast<float>(g.placed.bottom - g.placed.top);
-    const auto r = ComputeLayout(w, h).art;
-    return pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom;
 }
 
 int HitButton(POINT pt) {
@@ -1141,6 +1136,24 @@ void OpenSettingsFile() {
     ShellExecuteW(nullptr, L"open", L"notepad.exe", (L"\"" + SettingsPath() + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
 }
 
+// Clicking the widget opens the pop-up player above it, or closes it. A click
+// on the widget while the pop-up is open first takes focus from the pop-up,
+// which closes it; that same click mustn't reopen it a moment later.
+void TogglePopup() {
+    if (PopupIsOpen()) {
+        ClosePopup();
+        return;
+    }
+    if (GetTickCount64() - PopupClosedAt() < kPopupReopenGuardMs) return;
+    HideTooltip();
+    PopupPlacement placement;
+    GetWindowRect(g.widget, &placement.anchor);
+    GetWindowRect(g.taskbar, &placement.taskbar);
+    placement.dpi = g.dpi;
+    placement.lightTheme = g.lightTheme;
+    OpenPopup(g.instance, g.controller, placement);
+}
+
 // Briefly shows a line of feedback in place of the artist.
 void Flash(const std::wstring& text) {
     g.flashText = text;
@@ -1224,7 +1237,8 @@ void CreateTooltip() {
 
 // Shows the tooltip just above the widget, left-aligned with it.
 void ShowTooltip() {
-    if (!g.tooltip || !g.widget || g.tipShown || g.nowPlaying.title.empty()) return;
+    // The pop-up shows everything the tooltip would, so it stays out of the way.
+    if (!g.tooltip || !g.widget || g.tipShown || g.nowPlaying.title.empty() || PopupIsOpen()) return;
     TTTOOLINFOW tool{sizeof(tool)};
     tool.hwnd = g.widget;
     tool.uId = reinterpret_cast<UINT_PTR>(g.widget);
@@ -1384,7 +1398,7 @@ LRESULT CALLBACK WidgetProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HideTooltip();
         const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         g.pressed = HitButton(pt);
-        if (g.pressed == kNoButton && HitArt(pt) && !g.nowPlaying.appId.empty()) g.pressed = kPressedArt;
+        if (g.pressed == kNoButton && !g.nowPlaying.appId.empty()) g.pressed = kPressedBody;
         if (g.pressed != kNoButton) {
             SetCapture(hwnd);
             Render();
@@ -1397,9 +1411,8 @@ LRESULT CALLBACK WidgetProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         int pressedButton = g.pressed;
         g.pressed = kNoButton;
         if (GetCapture() == hwnd) ReleaseCapture();
-        if (pressedButton == kPressedArt && HitArt(pt)) {
-            // Clicking the cover jumps to the app that's playing.
-            if (!ActivateApp(g.nowPlaying.appId)) Log(L"Couldn't bring %s forward", g.nowPlaying.appId.c_str());
+        if (pressedButton == kPressedBody && released == kNoButton) {
+            TogglePopup(); // anywhere but the buttons
         } else if (pressedButton != kNoButton && released == pressedButton && ButtonEnabled(released)) {
             if (released == kButtonSwitchApp) {
                 g.media.SwitchSession(+1);
@@ -1554,6 +1567,7 @@ LRESULT CALLBACK ControllerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                kTimerMarquee, kTimerSettingsReload, kTimerFlash, kTimerFade}) {
             KillTimer(hwnd, timer);
         }
+        ClosePopup();
         UnregisterAppBar();
         for (int id : {kHotkeyPlayPause, kHotkeyNext, kHotkeyPrevious, kHotkeySwitchApp}) UnregisterHotKey(hwnd, id);
         g.controller = nullptr;
