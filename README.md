@@ -11,12 +11,17 @@ browsers (YouTube, Twitch) and media players.
 
 ## Features
 
-- Cover art with the playing app's icon on its corner
-- Title and artist, dimmed while paused
+- Cover art with the playing app's icon on its corner; click it to open the app
+- Title and artist, dimmed while paused; long text scrolls back and forth
 - Previous / play-pause / next buttons, greyed out when the app does not allow them
 - Seekbar along the bottom edge (display only), hidden for live streams
 - Switch between apps that are playing with the **›** button or the mouse wheel
-- Hides itself when nothing is playing, or after 30 seconds paused
+- Ctrl + scroll changes the playing app's own volume
+- Music apps take priority over browsers and video players (can be turned off)
+- Hide apps you never want to see, or make browsers show only when nothing else plays
+- Hides itself when nothing is playing, or after a while paused (or stays, if you prefer)
+- Right-click menu with shuffle, repeat, switching and all options
+- Optional start with Windows
 - Follows the system light/dark theme
 - Comes back by itself if Explorer restarts
 
@@ -42,11 +47,27 @@ to install.
 ## Use
 
 - Run `TaskbarMedia.exe`. The widget appears on the left side of the taskbar.
-- Click the buttons to control playback.
+- Click the buttons to control playback, or the cover art to open the app.
 - Scroll over the widget, or click **›**, to switch to another app that has media.
-- Right-click the widget and choose **Exit TaskbarMedia** to close it.
+  One scroll gesture switches one app.
+- Ctrl + scroll to change that app's volume.
+- Rest the mouse on the widget to see the full title.
+- Right-click for shuffle, repeat, switching, hiding apps, **Start with
+  Windows** and **Exit TaskbarMedia**.
 
-It does not start with Windows yet; run it again after a reboot.
+## Settings
+
+Settings are in `%APPDATA%\TaskbarMedia\settings.ini` (right-click >
+**Open settings file**). Every setting has a comment, and changes apply as
+soon as you save the file.
+
+| Setting | What it does |
+|---|---|
+| `StayVisibleWhenPaused` | Keep showing the last track while paused |
+| `HideAfterPausedSeconds` | Otherwise, hide after this many seconds paused |
+| `Ignore` | Apps never to show, separated by `;` (name, exe or app ID) |
+| `PreferMusicApps` / `MusicApps` | Show a playing music app over anything else |
+| `PreferNonBrowsers` / `Browsers` | Show a browser only while no other app plays |
 
 ## How it works
 
@@ -55,14 +76,18 @@ is injected into Explorer and no system files are changed.
 
 | File | What it does |
 |---|---|
-| `src/main.cpp` | The widget window, layout and drawing (Direct2D in software mode). A hidden window listens for Windows broadcasts such as Explorer restarts and theme changes. |
+| `src/main.cpp` | The widget window, layout, drawing (Direct2D in software mode), menu and tooltip. A hidden window listens for Windows broadcasts such as Explorer restarts and theme changes. |
 | `src/taskbar_watcher.*` | Finds the Start and Widgets buttons with UI Automation, on its own thread, to know where the free space is. |
-| `src/media_watcher.*` | Follows the Windows media sessions (`GlobalSystemMediaTransportControls`) on one worker thread, and decodes cover art and app icons. |
+| `src/media_watcher.*` | Follows the Windows media sessions (`GlobalSystemMediaTransportControls`) on one worker thread, picks which one to show, and decodes cover art and app icons. |
+| `src/app_info.*` | The app behind a session: its name, exe and windows (to open it). |
+| `src/settings.*` | Reading and writing `settings.ini`, and the Start with Windows entry. |
+| `src/volume.*` | Changing one app's volume through the Windows audio session API. |
 
 The app is event-driven: it only wakes up when Windows reports a change.
-The one recurring timer is the seekbar, which redraws once each time the bar
-grows by a pixel, and only while something is playing and the widget is
-visible. When idle it uses no CPU.
+The only recurring timers are the seekbar, which redraws once each time the
+bar grows by a pixel, and scrolling text, which only copies a pre-drawn strip
+of pixels while the text is moving. Both run only while something is playing
+and the widget is visible. When idle it uses no CPU.
 
 ## Known limitations
 
