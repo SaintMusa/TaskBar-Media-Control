@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <shellapi.h>
+#include <commctrl.h>
 #include <d2d1.h>
 #include <dwrite.h>
 #include <wrl/client.h>
@@ -22,6 +23,7 @@
 #include "media_watcher.h"
 #include "settings.h"
 #include "taskbar_watcher.h"
+#include "volume.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -44,6 +46,7 @@ enum : UINT_PTR {
     kTimerWheelRest,
     kTimerMarquee,
     kTimerSettingsReload,
+    kTimerVolumeShown,
 };
 enum : UINT {
     kCmdExit = 1,
@@ -66,6 +69,8 @@ constexpr UINT kRelayoutDelayMs = 120; // coalesces bursts while icons animate
 constexpr UINT kAttachRetryMs = 1000;  // only while Explorer is (re)starting
 constexpr UINT kWheelRestMs = 300;     // wheel quiet this long = the scroll gesture ended
 constexpr UINT kSettingsSettleMs = 200; // editors save in several writes; reload once after
+constexpr UINT kVolumeShownMs = 1500;   // how long Ctrl+scroll shows the volume
+constexpr float kVolumeStep = 0.05f;    // per wheel notch
 constexpr int kPreferredWidth = 300;   // all sizes in DIPs (96 DPI pixels)
 constexpr int kMinWidth = 160;
 constexpr int kMargin = 8;
@@ -155,6 +160,11 @@ struct State {
     int pressed = kNoButton;
     bool trackingMouse = false;
     bool wheelGesture = false; // a scroll is in progress and has already switched
+    int volumeShown = -1;      // percent shown after Ctrl+scroll; -1 none, 101 = no control
+    std::wstring volumeAppId;  // app whose exe volumeExe is
+    std::wstring volumeExe;    // its audio exe, looked up once per app
+    HWND tooltip = nullptr;
+    bool tipShown = false;
 
     bool fits = false;       // the taskbar has room for us
     bool fullscreen = false; // a full screen app or game is in front
@@ -453,13 +463,17 @@ void DrawStatic(const WidgetLayout& layout, float w, float h) {
     const std::wstring title = media.appId.empty() ? L"Nothing playing"
                                : media.title.empty() ? L"Untitled"
                                                      : media.title;
+    // Right after Ctrl+scroll, the artist line briefly shows the app's volume instead.
+    const std::wstring artist = g.volumeShown < 0 ? media.artist
+                                : g.volumeShown > 100 ? L"No volume control for this app"
+                                                      : L"Volume " + std::to_wstring(g.volumeShown) + L"%";
     const auto& text = layout.text;
     g.overflowing.clear();
-    if (media.artist.empty()) {
+    if (artist.empty()) {
         DrawLine(title, g.titleFormat.Get(), text, titleInk.Get());
     } else {
         DrawLine(title, g.titleFormat.Get(), D2D1::RectF(text.left, h * 0.08f, text.right, h * 0.54f), titleInk.Get());
-        DrawLine(media.artist, g.artistFormat.Get(), D2D1::RectF(text.left, h * 0.5f, text.right, h * 0.92f),
+        DrawLine(artist, g.artistFormat.Get(), D2D1::RectF(text.left, h * 0.5f, text.right, h * 0.92f),
                  artistInk.Get());
     }
 
@@ -725,9 +739,17 @@ void OnMarqueeTick() {
 // ---------------------------------------------------------------------------
 // Attaching to the taskbar and laying out.
 
+void CreateTooltip(); // with the menu code below
+void UpdateTooltip();
+void ShowTooltip();
+void HideTooltip();
+
 void ScheduleRelayout() { SetTimer(g.controller, kTimerRelayout, kRelayoutDelayMs, nullptr); }
 
 void Detach() {
+    if (g.tooltip) DestroyWindow(g.tooltip);
+    g.tooltip = nullptr;
+    g.tipShown = false;
     if (g.widget && IsWindow(g.widget)) DestroyWindow(g.widget);
     g.widget = nullptr;
     g.taskbar = nullptr;
@@ -759,6 +781,7 @@ void Attach() {
     }
     g.taskbar = taskbar;
     g.dpi = GetDpiForWindow(taskbar);
+    CreateTooltip();
     Log(L"Attached to taskbar %p at %u DPI", taskbar, g.dpi);
     g.watcher.Refresh(taskbar);
 }
@@ -895,6 +918,7 @@ void OnMediaChanged() {
         SetTimer(g.controller, kTimerIdleHide, g.settings.hideAfterPausedSeconds * 1000, nullptr);
     }
     UpdateVisibility();
+    UpdateTooltip();
 
     // Apps like Spotify re-report their position every few seconds; when that's
     // all that changed, only the seekbar needs drawing.
@@ -927,6 +951,78 @@ void ApplySettings(const Settings& next) {
 
 void OpenSettingsFile() {
     ShellExecuteW(nullptr, L"open", L"notepad.exe", (L"\"" + SettingsPath() + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
+}
+
+// Ctrl+scroll: the playing app's own volume, 5% per notch, shown on the
+// artist line for a moment.
+void ChangeVolume(int wheelDelta) {
+    const std::wstring& appId = g.nowPlaying.appId;
+    if (appId.empty()) return;
+    if (appId != g.volumeAppId) {
+        g.volumeAppId = appId;
+        g.volumeExe = AppExeName(appId);
+    }
+    const float step = kVolumeStep * wheelDelta / WHEEL_DELTA;
+    const auto level = ChangeAppVolume(g.volumeExe, step);
+    g.volumeShown = level ? static_cast<int>(std::lround(*level * 100)) : 101;
+    SetTimer(g.controller, kTimerVolumeShown, kVolumeShownMs, nullptr);
+    Render();
+}
+
+// Hovering shows the full title, artist and app, since long lines scroll or get cut.
+void UpdateTooltip() {
+    if (!g.tooltip || !g.widget) return;
+    const MediaInfo& m = g.nowPlaying;
+    std::wstring tip = m.title;
+    if (!m.artist.empty()) tip += L"\n" + m.artist;
+    if (!m.appName.empty()) tip += L"\n" + m.appName;
+    TTTOOLINFOW tool{sizeof(tool)};
+    tool.hwnd = g.widget;
+    tool.uId = reinterpret_cast<UINT_PTR>(g.widget);
+    tool.lpszText = tip.data();
+    SendMessageW(g.tooltip, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&tool));
+}
+
+void CreateTooltip() {
+    g.tooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+                                CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, g.controller, nullptr,
+                                g.instance, nullptr);
+    if (!g.tooltip) return;
+    TTTOOLINFOW tool{sizeof(tool)};
+    // A tracking tooltip that we show and place ourselves: an ordinary one
+    // never activates for a window living inside Explorer's taskbar.
+    tool.uFlags = TTF_IDISHWND | TTF_TRACK | TTF_ABSOLUTE;
+    tool.hwnd = g.widget;
+    tool.uId = reinterpret_cast<UINT_PTR>(g.widget);
+    tool.lpszText = const_cast<wchar_t*>(L"");
+    SendMessageW(g.tooltip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
+    SendMessageW(g.tooltip, TTM_SETMAXTIPWIDTH, 0, Scale(400)); // allows the line breaks
+    UpdateTooltip();
+}
+
+// Shows the tooltip just above the widget, left-aligned with it.
+void ShowTooltip() {
+    if (!g.tooltip || !g.widget || g.tipShown || g.nowPlaying.title.empty()) return;
+    TTTOOLINFOW tool{sizeof(tool)};
+    tool.hwnd = g.widget;
+    tool.uId = reinterpret_cast<UINT_PTR>(g.widget);
+    RECT widget;
+    GetWindowRect(g.widget, &widget);
+    SendMessageW(g.tooltip, TTM_TRACKPOSITION, 0, MAKELPARAM(widget.left, widget.top));
+    SendMessageW(g.tooltip, TTM_TRACKACTIVATE, TRUE, reinterpret_cast<LPARAM>(&tool));
+    const DWORD bubble = static_cast<DWORD>(SendMessageW(g.tooltip, TTM_GETBUBBLESIZE, 0, reinterpret_cast<LPARAM>(&tool)));
+    const int y = widget.top - HIWORD(bubble) - Scale(6);
+    SendMessageW(g.tooltip, TTM_TRACKPOSITION, 0, MAKELPARAM(widget.left, y));
+    g.tipShown = true;
+}
+
+void HideTooltip() {
+    if (!g.tooltip || !g.tipShown) return;
+    TTTOOLINFOW tool{sizeof(tool)};
+    tool.hwnd = g.widget;
+    tool.uId = reinterpret_cast<UINT_PTR>(g.widget);
+    SendMessageW(g.tooltip, TTM_TRACKACTIVATE, FALSE, reinterpret_cast<LPARAM>(&tool));
+    g.tipShown = false;
 }
 
 // Saves a changed copy of the settings and applies it.
@@ -1028,25 +1124,33 @@ LRESULT CALLBACK WidgetProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSEACTIVATE:
         return MA_NOACTIVATE; // never steal focus from the user's app
     case WM_MOUSEMOVE: {
-        if (!g.trackingMouse) {
-            TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, hwnd, 0};
+        // Leave tells us to clear the highlight; hover (the mouse resting a
+        // moment) shows the tooltip. Re-armed while moving, until it shows.
+        if (!g.trackingMouse || !g.tipShown) {
+            TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE | (g.tipShown ? 0u : TME_HOVER), hwnd, HOVER_DEFAULT};
             g.trackingMouse = TrackMouseEvent(&track);
         }
         int hit = HitButton({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+        if (hit != kNoButton) HideTooltip();
         if (hit != g.hovered) {
             g.hovered = hit;
             Render(); // redraw only when the highlighted button changes
         }
         return 0;
     }
+    case WM_MOUSEHOVER:
+        if (HitButton({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}) == kNoButton) ShowTooltip();
+        return 0;
     case WM_MOUSELEAVE:
         g.trackingMouse = false;
+        HideTooltip();
         if (g.hovered != kNoButton) {
             g.hovered = kNoButton;
             Render();
         }
         return 0;
     case WM_LBUTTONDOWN: {
+        HideTooltip();
         const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         g.pressed = HitButton(pt);
         if (g.pressed == kNoButton && HitArt(pt) && !g.nowPlaying.appId.empty()) g.pressed = kPressedArt;
@@ -1084,6 +1188,10 @@ LRESULT CALLBACK WidgetProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     case WM_MOUSEWHEEL:
+        if (GET_KEYSTATE_WPARAM(wp) & MK_CONTROL) {
+            ChangeVolume(GET_WHEEL_DELTA_WPARAM(wp));
+            return 0;
+        }
         // One scroll gesture = one app, however many notches it has: switch on
         // the first notch, then ignore the wheel until it rests for a moment.
         // Down goes to the next session, up to the previous.
@@ -1164,6 +1272,9 @@ LRESULT CALLBACK ControllerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g.wheelGesture = false;
         } else if (wp == kTimerMarquee) {
             OnMarqueeTick();
+        } else if (wp == kTimerVolumeShown) {
+            g.volumeShown = -1;
+            Render();
         } else if (wp == kTimerSettingsReload) {
             if (Settings next = LoadSettings(); !(next == g.settings)) {
                 Log(L"Settings file changed; applying");
@@ -1199,7 +1310,7 @@ LRESULT CALLBACK ControllerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 average(g.marqueeTicks, g.marqueeRenders), average(g.presentTicks, total));
         }
         for (UINT_PTR timer : {kTimerRelayout, kTimerAttachRetry, kTimerProgress, kTimerIdleHide, kTimerWheelRest,
-                               kTimerMarquee, kTimerSettingsReload}) {
+                               kTimerMarquee, kTimerSettingsReload, kTimerVolumeShown}) {
             KillTimer(hwnd, timer);
         }
         UnregisterAppBar();
@@ -1220,6 +1331,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     // The UI thread uses the shell (app windows, launching) and Core Audio (volume).
     const HRESULT comInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     OpenLog();
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_BAR_CLASSES}; // tooltips
+    InitCommonControlsEx(&controls);
     g.instance = instance;
     g.settings = LoadSettings();
     g.lightTheme = ReadLightTheme();
