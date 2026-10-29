@@ -28,10 +28,14 @@ constexpr int kControlsTop = 316, kButton = 40, kPlayButton = 48, kButtonGap = 6
 constexpr int kNowPlayingBottom = 372;
 // The app list, only when two or more apps have media.
 constexpr int kRowHeight = 48, kRowInset = 8, kRowArt = 32, kRowRadius = 6, kMaxRows = 5, kListPad = 8;
+constexpr int kFooterHeight = 40, kGearSize = 32;
+constexpr int kSlideDistance = 12;  // DIPs it rises while opening
+constexpr ULONGLONG kSlideMs = 160;
+constexpr UINT kSlideFrameMs = 10;
 constexpr int kGapAboveTaskbar = 12; // like Windows' own flyouts
 
 constexpr int64_t kWheelSeekMs = 5000;
-constexpr UINT_PTR kTimerProgress = 1;
+constexpr UINT_PTR kTimerProgress = 1, kTimerSlide = 2;
 
 // Segoe Fluent Icons code points.
 constexpr wchar_t kGlyphShuffle = 0xE8B1;
@@ -42,6 +46,7 @@ constexpr wchar_t kGlyphNext = 0xE893;
 constexpr wchar_t kGlyphRepeatAll = 0xE8EE;
 constexpr wchar_t kGlyphRepeatOne = 0xE8ED;
 constexpr wchar_t kGlyphMusic = 0xE8D6;
+constexpr wchar_t kGlyphSettings = 0xE713;
 
 // DWM attributes newer than some SDK headers.
 constexpr DWORD kUseImmersiveDarkMode = 20;  // DWMWA_USE_IMMERSIVE_DARK_MODE
@@ -51,7 +56,7 @@ constexpr int kCornerRound = 2;              // DWMWCP_ROUND
 constexpr int kBackdropTransientWindow = 3;  // DWMSBT_TRANSIENTWINDOW: acrylic, as in flyouts
 
 // Everything the mouse can point at.
-enum class Hit { None, Header, Art, Seek, Shuffle, Previous, PlayPause, Next, Repeat, Row };
+enum class Hit { None, Header, Art, Seek, Shuffle, Previous, PlayPause, Next, Repeat, Row, Options };
 constexpr Hit kControls[] = {Hit::Shuffle, Hit::Previous, Hit::PlayPause, Hit::Next, Hit::Repeat};
 
 struct PopupState {
@@ -64,6 +69,8 @@ struct PopupState {
     Hit hovered = Hit::None;
     Hit pressed = Hit::None;
     int hoveredRow = -1, pressedRow = -1; // with Hit::Row
+    int focusedRow = -1;       // picked with the arrow keys, switched to with Enter
+    ULONGLONG slideStart = 0;
     int bottom = 0; // screen y the pop-up's bottom edge stays at as it grows or shrinks
     bool trackingMouse = false;
     bool dragging = false;     // the seekbar thumb is held
@@ -85,6 +92,7 @@ struct PopupState {
 } p;
 
 float S(float dip) { return dip * p.dpi / 96.0f; }
+void Redraw(); // further down, with painting
 int Scale(int dip) { return MulDiv(dip, static_cast<int>(p.dpi), 96); }
 
 D2D1_COLOR_F Ink(float alpha) {
@@ -163,9 +171,17 @@ int RowCount(const MediaInfo& m) {
     return m.sessions.size() < 2 ? 0 : std::min<int>(static_cast<int>(m.sessions.size()), kMaxRows);
 }
 
-int ContentHeight(const MediaInfo& m) {
+int FooterTop(const MediaInfo& m) {
     const int rows = RowCount(m);
     return kNowPlayingBottom + (rows ? 1 + kListPad * 2 + rows * kRowHeight : 0);
+}
+
+int ContentHeight(const MediaInfo& m) { return FooterTop(m) + 1 + kFooterHeight; }
+
+D2D1_RECT_F GearRect(const MediaInfo& m) {
+    const float top = S(static_cast<float>(FooterTop(m))) + S(1) + (S(kFooterHeight) - S(kGearSize)) / 2;
+    const float right = S(kWidth) - S(kRowInset);
+    return D2D1::RectF(right - S(kGearSize), top, right, top + S(kGearSize));
 }
 
 D2D1_RECT_F RowRect(int index) {
@@ -176,6 +192,7 @@ D2D1_RECT_F RowRect(int index) {
 Hit HitTest(POINT pt) {
     const MediaInfo& m = p.host.media();
     if (Contains(HeaderRect(), pt)) return Hit::Header;
+    if (Contains(GearRect(m), pt)) return Hit::Options;
     if (Contains(ArtRect(), pt)) return Hit::Art;
     if (m.hasTimeline && Contains(SeekHitRect(), pt)) return Hit::Seek;
     for (Hit c : kControls) {
@@ -467,7 +484,7 @@ void DrawAppList(const MediaInfo& m, ID2D1SolidColorBrush* paint) {
         const SessionSummary& s = m.sessions[i];
         const auto row = RowRect(i);
         const bool current = s.appId == m.appId;
-        if (current || p.hoveredRow == i) {
+        if (current || p.hoveredRow == i || p.focusedRow == i) {
             paint->SetColor(Ink(current ? 0.08f : (p.pressedRow == i ? 0.04f : 0.05f)));
             p.target->FillRoundedRectangle(D2D1::RoundedRect(row, S(kRowRadius), S(kRowRadius)), paint);
         }
@@ -513,6 +530,76 @@ void DrawAppList(const MediaInfo& m, ID2D1SolidColorBrush* paint) {
     }
 }
 
+// The footer: a gear for the options menu, until there's a settings window.
+void DrawFooter(const MediaInfo& m, ID2D1SolidColorBrush* paint) {
+    const float top = S(static_cast<float>(FooterTop(m)));
+    paint->SetColor(Ink(0.08f));
+    p.target->FillRectangle(D2D1::RectF(0, top, S(kWidth), top + S(1)), paint);
+    const auto gear = GearRect(m);
+    if (p.hovered == Hit::Options) {
+        paint->SetColor(Ink(p.pressed == Hit::Options ? 0.05f : 0.08f));
+        p.target->FillRoundedRectangle(D2D1::RoundedRect(gear, S(kButtonRadius), S(kButtonRadius)), paint);
+    }
+    paint->SetColor(Ink(p.hovered == Hit::Options ? 0.95f : 0.72f));
+    p.target->DrawTextW(&kGlyphSettings, 1, p.iconFormat.Get(), gear, paint);
+}
+
+// Slides up into place on open, like Windows' flyouts, unless animations are off.
+void SlideStep() {
+    if (!p.hwnd) return;
+    const double t = std::min(1.0, static_cast<double>(GetTickCount64() - p.slideStart) / kSlideMs);
+    const double eased = 1 - (1 - t) * (1 - t) * (1 - t); // ease out: quick, then settles
+    RECT window;
+    GetWindowRect(p.hwnd, &window);
+    const int height = window.bottom - window.top;
+    const int offset = static_cast<int>(std::lround(Scale(kSlideDistance) * (1 - eased)));
+    SetWindowPos(p.hwnd, nullptr, window.left, p.bottom - height + offset, 0, 0,
+                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    if (t >= 1) KillTimer(p.hwnd, kTimerSlide);
+}
+
+// Keyboard, while the pop-up has focus.
+void OnKey(WPARAM key) {
+    const MediaInfo& m = p.host.media();
+    const bool shift = GetKeyState(VK_SHIFT) < 0;
+    const int rows = RowCount(m);
+    switch (key) {
+    case VK_ESCAPE: ClosePopup(); return;
+    case VK_SPACE:
+        if (m.canPlayPause) p.host.send(MediaCommand::PlayPause);
+        return;
+    case VK_LEFT:
+    case VK_RIGHT: {
+        const int direction = key == VK_RIGHT ? 1 : -1;
+        if (shift) {
+            if (CanSeek(m)) {
+                p.host.seek(std::clamp<int64_t>(m.PositionAt(NowFileTime()) + direction * kWheelSeekMs, 0,
+                                                m.durationMs));
+            }
+        } else if (direction > 0 ? m.canNext : m.canPrevious) {
+            p.host.send(direction > 0 ? MediaCommand::Next : MediaCommand::Previous);
+        }
+        return;
+    }
+    case VK_UP:
+    case VK_DOWN: {
+        if (!rows) return;
+        int current = p.focusedRow;
+        if (current < 0) { // start from the app on screen
+            for (int i = 0; i < rows; ++i) {
+                if (m.sessions[i].appId == m.appId) current = i;
+            }
+        }
+        p.focusedRow = std::clamp(current + (key == VK_DOWN ? 1 : -1), 0, rows - 1);
+        Redraw();
+        return;
+    }
+    case VK_RETURN:
+        if (p.focusedRow >= 0 && p.focusedRow < rows) p.host.pick(m.sessions[p.focusedRow].appId);
+        return;
+    }
+}
+
 // Keeps the window as tall as its content, growing upward from a fixed bottom.
 void FitHeight() {
     if (!p.hwnd) return;
@@ -542,6 +629,7 @@ void Paint(HDC windowDC) {
     if (paint) {
         DrawNowPlaying(p.host.media(), paint.Get());
         DrawAppList(p.host.media(), paint.Get());
+        DrawFooter(p.host.media(), paint.Get());
     }
     if (p.target->EndDraw() == D2DERR_RECREATE_TARGET) {
         p.target.Reset();
@@ -582,6 +670,7 @@ void Activate(Hit hit) {
     case Hit::Previous: p.host.send(MediaCommand::Previous); break;
     case Hit::PlayPause: p.host.send(MediaCommand::PlayPause); break;
     case Hit::Next: p.host.send(MediaCommand::Next); break;
+    case Hit::Options: p.host.options(); break; // the menu taking focus closes the pop-up
     case Hit::Repeat: // off -> all -> one -> off, like most players
         p.host.send(m.repeat == RepeatMode::Off   ? MediaCommand::RepeatAll
                     : m.repeat == RepeatMode::All ? MediaCommand::RepeatOne
@@ -595,7 +684,8 @@ bool Clickable(Hit hit, const MediaInfo& m) {
     switch (hit) {
     case Hit::Header:
     case Hit::Art:
-    case Hit::Row: return true;
+    case Hit::Row:
+    case Hit::Options: return true;
     case Hit::Seek: return CanSeek(m);
     case Hit::None: return false;
     default: return ControlEnabled(hit, m);
@@ -609,7 +699,7 @@ LRESULT CALLBACK PopupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (LOWORD(wp) == WA_INACTIVE) ClosePopup();
         return 0;
     case WM_KEYDOWN:
-        if (wp == VK_ESCAPE) ClosePopup();
+        OnKey(wp);
         return 0;
     case WM_NCCALCSIZE:
         // The window has a frame style only so DWM gives it a backdrop; this
@@ -725,6 +815,8 @@ LRESULT CALLBACK PopupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == kTimerProgress) {
             Redraw();
             ScheduleProgress();
+        } else if (wp == kTimerSlide) {
+            SlideStep();
         }
         return 0;
     case WM_ERASEBKGND:
@@ -739,10 +831,11 @@ LRESULT CALLBACK PopupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DESTROY:
         if (hwnd == p.hwnd) {
             KillTimer(hwnd, kTimerProgress);
+            KillTimer(hwnd, kTimerSlide);
             p.hwnd = nullptr;
             p.closedAt = GetTickCount64();
             p.hovered = p.pressed = Hit::None;
-            p.hoveredRow = p.pressedRow = -1;
+            p.hoveredRow = p.pressedRow = p.focusedRow = -1;
             p.dragging = p.trackingMouse = false;
             FreeGraphics(); // everything the pop-up used goes with it
             if (p.host.closed) p.host.closed();
@@ -794,6 +887,13 @@ void OpenPopup(HINSTANCE instance, HWND owner, const PopupPlacement& placement, 
     const MARGINS whole{-1, -1, -1, -1};
     DwmExtendFrameIntoClientArea(p.hwnd, &whole);
 
+    BOOL animate = TRUE;
+    SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animate, 0);
+    if (animate) { // start a little low and rise into place
+        SetWindowPos(p.hwnd, nullptr, x, y + Scale(kSlideDistance), 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        p.slideStart = GetTickCount64();
+        SetTimer(p.hwnd, kTimerSlide, kSlideFrameMs, nullptr);
+    }
     ShowWindow(p.hwnd, SW_SHOW);
     SetForegroundWindow(p.hwnd); // so a click anywhere else closes it
     ScheduleProgress();

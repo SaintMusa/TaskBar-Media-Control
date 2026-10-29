@@ -447,7 +447,7 @@ void DrawStatic(const WidgetLayout& layout, float w, float h) {
     // Paused media is drawn dimmer so the state reads at a glance.
     const float textAlpha = media.playing ? 0.92f : 0.6f;
     ComPtr<ID2D1SolidColorBrush> fill, border, titleInk, artistInk, paint;
-    g.target->CreateSolidColorBrush(InkAt(0.08f), &fill);
+    g.target->CreateSolidColorBrush(InkAt(PopupIsOpen() ? 0.14f : 0.08f), &fill); // "selected" while open
     g.target->CreateSolidColorBrush(InkAt(0.12f), &border);
     g.target->CreateSolidColorBrush(InkAt(textAlpha), &titleInk);
     g.target->CreateSolidColorBrush(InkAt(textAlpha * 0.7f), &artistInk);
@@ -1141,6 +1141,7 @@ void OpenSettingsFile() {
 // on the widget while the pop-up is open first takes focus from the pop-up,
 // which closes it; that same click mustn't reopen it a moment later.
 void SeekToMs(int64_t positionMs); // with the scroll handling below
+void ShowMenu();                   // with the menu code below
 
 void TogglePopup() {
     if (PopupIsOpen()) {
@@ -1148,6 +1149,7 @@ void TogglePopup() {
         return;
     }
     if (GetTickCount64() - PopupClosedAt() < kPopupReopenGuardMs) return;
+    if (g.fullscreen) return; // never over a full screen game or video
     HideTooltip();
     PopupPlacement placement;
     GetWindowRect(g.widget, &placement.anchor);
@@ -1161,9 +1163,14 @@ void TogglePopup() {
     host.seek = [](int64_t positionMs) { SeekToMs(positionMs); };
     host.openApp = [] { ActivateApp(g.nowPlaying.appId); };
     host.pick = [](const std::wstring& appId) { g.media.ShowSession(appId); };
-    host.closed = [] { g.media.SetLargeArtSize(0); }; // the big cover isn't kept around
+    host.options = [] { ShowMenu(); };
+    host.closed = [] {
+        g.media.SetLargeArtSize(0); // the big cover isn't kept around
+        Render();                   // drop the widget's "open" look
+    };
     g.media.SetLargeArtSize(PopupArtSize(g.dpi));
     OpenPopup(g.instance, g.controller, placement, std::move(host));
+    Render(); // the widget looks selected while its pop-up is open
 }
 
 // Briefly shows a line of feedback in place of the artist.
@@ -1563,6 +1570,7 @@ LRESULT CALLBACK ControllerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (light != g.lightTheme) {
                 g.lightTheme = light;
                 Log(L"Theme changed: %s", light ? L"light" : L"dark");
+                ClosePopup(); // its backdrop and colors were set for the old theme
                 Render();
             }
         }
