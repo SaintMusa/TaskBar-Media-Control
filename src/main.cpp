@@ -47,6 +47,7 @@ enum : UINT_PTR {
     kTimerMarquee,
     kTimerSettingsReload,
     kTimerFlash,
+    kTimerFade,
 };
 enum : UINT {
     kCmdExit = 1,
@@ -74,6 +75,8 @@ constexpr UINT kSettingsSettleMs = 200; // editors save in several writes; reloa
 constexpr UINT kFlashMs = 1500;         // how long volume or seek feedback shows
 constexpr float kVolumeStep = 0.05f;    // per wheel notch
 constexpr int64_t kSeekStepMs = 5000;   // per wheel notch
+constexpr ULONGLONG kFadeMs = 220;      // cross-fade between tracks
+constexpr UINT kFadeFrameMs = 15;       // only while a fade is running
 constexpr int kPreferredWidth = 300;   // all sizes in DIPs (96 DPI pixels)
 constexpr int kMinWidth = 160;
 constexpr int kMargin = 8;
@@ -189,6 +192,13 @@ struct State {
     ComPtr<ID2D1RoundedRectangleGeometry> boxClip;
     D2D1_SIZE_F boxClipSize{};
     ComPtr<ID2D1Layer> clipLayer;
+    size_t presentedBytes = 0;      // size of the frame on screen; 0 = the bitmap was recreated since
+
+    // Track-change cross-fade: from the frame that was on screen to the new one.
+    bool fadeNext = false;          // the next full redraw should fade in
+    bool fading = false;
+    ULONGLONG fadeStart = 0;
+    std::vector<BYTE> fadeFrom, fadeTo;
 
     RECT placed{}; // widget rect, relative to the taskbar
     UINT dpi = 96;
@@ -259,6 +269,7 @@ void FreeBitmap() {
     g.oldBitmap = nullptr;
     g.dibBits = nullptr;
     g.bitmapSize = {};
+    g.presentedBytes = 0;
     g.staticPixels.clear();
 }
 
@@ -682,6 +693,49 @@ void ScheduleMarquee() {
     SetTimer(g.controller, kTimerMarquee, static_cast<UINT>(std::max<ULONGLONG>(next, kMarqueeFrameMs)), nullptr);
 }
 
+// Hands the bitmap to Windows as the widget's new look.
+void Present() {
+    POINT source{0, 0};
+    SIZE size = g.bitmapSize;
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    if (!UpdateLayeredWindow(g.widget, nullptr, nullptr, &size, g.memDC, &source, 0, &blend, ULW_ALPHA)) {
+        Log(L"UpdateLayeredWindow failed: %lu", GetLastError());
+    }
+    g.presentedBytes = static_cast<size_t>(size.cx) * size.cy * 4;
+}
+
+void StopFade() {
+    if (g.fading) KillTimer(g.controller, kTimerFade);
+    g.fading = false;
+}
+
+// One step of the cross-fade: a straight blend of the two frames' pixels,
+// eased so it starts and ends gently.
+void FadeTick() {
+    const size_t bytes = g.fadeTo.size();
+    auto* bits = static_cast<BYTE*>(g.dibBits);
+    if (!g.fading || !g.widget || !bits || g.fadeFrom.size() != bytes ||
+        bytes != static_cast<size_t>(g.bitmapSize.cx) * g.bitmapSize.cy * 4) {
+        StopFade();
+        return;
+    }
+    double t = static_cast<double>(GetTickCount64() - g.fadeStart) / kFadeMs;
+    if (t >= 1) {
+        memcpy(bits, g.fadeTo.data(), bytes);
+        Present();
+        StopFade();
+        ScheduleMarquee();
+        return;
+    }
+    t = t * t * (3 - 2 * t);
+    const int weight = static_cast<int>(t * 256);
+    for (size_t i = 0; i < bytes; ++i) {
+        const int from = g.fadeFrom[i];
+        bits[i] = static_cast<BYTE>(from + (((g.fadeTo[i] - from) * weight) >> 8));
+    }
+    Present();
+}
+
 // Draws and presents the widget, reusing as much of the last frame as `what`
 // allows: the static parts are kept, then the seekbar on top of them.
 void Render(Redraw what = Redraw::Full) {
@@ -697,6 +751,16 @@ void Render(Redraw what = Redraw::Full) {
     const size_t bytes = static_cast<size_t>(size.cx) * size.cy * 4;
     auto* bits = static_cast<BYTE*>(g.dibBits);
     if (g.staticPixels.size() != bytes) what = Redraw::Full;
+    // A fade in progress owns the screen: small updates wait for it, and a
+    // full redraw (say, hovering a button) ends it on the spot.
+    if (g.fading) {
+        if (what != Redraw::Full) return;
+        StopFade();
+    }
+    // The bitmap still holds what's on screen, which is where a fade starts from.
+    const bool startFade = g.fadeNext && what == Redraw::Full && g.presentedBytes == bytes;
+    g.fadeNext = false;
+    if (startFade) g.fadeFrom.assign(bits, bits + bytes);
     if (what == Redraw::Marquee && g.basePixels.size() != bytes) what = Redraw::Seekbar;
     const Redraw measured = what;
 
@@ -736,13 +800,17 @@ void Render(Redraw what = Redraw::Full) {
         return;
     }
     BlendMarquees();
+    if (startFade) {
+        // Keep the old frame up; FadeTick blends it into this new one.
+        g.fadeTo.assign(bits, bits + bytes);
+        memcpy(bits, g.fadeFrom.data(), bytes);
+        g.fading = true;
+        g.fadeStart = GetTickCount64();
+        SetTimer(g.controller, kTimerFade, kFadeFrameMs, nullptr);
+    }
 
     QueryPerformanceCounter(&t1);
-    POINT source{0, 0};
-    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-    if (!UpdateLayeredWindow(g.widget, nullptr, nullptr, &size, g.memDC, &source, 0, &blend, ULW_ALPHA)) {
-        Log(L"UpdateLayeredWindow failed: %lu", GetLastError());
-    }
+    Present();
     QueryPerformanceCounter(&t2);
     const int64_t spent = t1.QuadPart - t0.QuadPart;
     switch (measured) {
@@ -942,6 +1010,9 @@ void OnMediaChanged() {
     }
     UpdateVisibility();
     UpdateTooltip();
+    // A different track (or app) cross-fades in, if the widget was already showing one.
+    g.fadeNext = IsWindowVisible(g.widget) && !previous.appId.empty() &&
+                 (m.appId != previous.appId || m.title != previous.title || m.art != previous.art);
 
     // Apps like Spotify re-report their position every few seconds; when that's
     // all that changed, only the seekbar needs drawing.
@@ -1422,6 +1493,9 @@ LRESULT CALLBACK ControllerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g.wheelGesture = false;
         } else if (wp == kTimerMarquee) {
             OnMarqueeTick();
+        } else if (wp == kTimerFade) {
+            SetTimer(hwnd, kTimerFade, kFadeFrameMs, nullptr); // FadeTick stops it when done
+            FadeTick();
         } else if (wp == kTimerFlash) {
             g.flashText.clear();
             Render();
@@ -1460,7 +1534,7 @@ LRESULT CALLBACK ControllerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 average(g.marqueeTicks, g.marqueeRenders), average(g.presentTicks, total));
         }
         for (UINT_PTR timer : {kTimerRelayout, kTimerAttachRetry, kTimerProgress, kTimerIdleHide, kTimerWheelRest,
-                               kTimerMarquee, kTimerSettingsReload, kTimerFlash}) {
+                               kTimerMarquee, kTimerSettingsReload, kTimerFlash, kTimerFade}) {
             KillTimer(hwnd, timer);
         }
         UnregisterAppBar();
