@@ -889,9 +889,14 @@ void OnMediaChanged() {
     Render(sameTimeline == previous ? Redraw::Seekbar : Redraw::Full);
 }
 
+AppFilter FilterFrom(const Settings& s) { return {s.ignoredApps, s.browsers, s.preferNonBrowsers}; }
+
 // Takes new settings (from the menu or an edit of the file) into effect.
 void ApplySettings(const Settings& next) {
+    const bool filterChanged = next.ignoredApps != g.settings.ignoredApps || next.browsers != g.settings.browsers ||
+                               next.preferNonBrowsers != g.settings.preferNonBrowsers;
     g.settings = next;
+    if (filterChanged) g.media.SetFilter(FilterFrom(g.settings));
     if (g.settings.stayVisibleWhenPaused) {
         KillTimer(g.controller, kTimerIdleHide);
         g.idleHidden = false;
@@ -1156,6 +1161,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
                                    nullptr, nullptr, instance, nullptr);
     // --no-media: diagnostic switch to measure the cost of media sessions alone.
     const bool mediaEnabled = !wcsstr(GetCommandLineW(), L"--no-media");
+    g.media.SetFilter(FilterFrom(g.settings)); // before Start, so ignored apps never flash up
     if (!g.controller || !g.watcher.Start(g.controller, WM_APP_GEOMETRY, WM_APP_TASKBAR_CHANGED) ||
         (mediaEnabled && !g.media.Start(g.controller, WM_APP_MEDIA))) {
         return 1;

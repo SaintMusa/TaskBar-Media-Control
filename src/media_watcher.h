@@ -45,6 +45,16 @@ struct MediaInfo {
 
 enum class MediaCommand { None, Previous, PlayPause, Next };
 
+// Which apps to leave out, and whether browsers should give way to other apps.
+struct AppFilter {
+    std::vector<std::wstring> ignored;  // exact app ID or name, ignoring case
+    std::vector<std::wstring> browsers; // any of these within the app ID or name
+    bool preferNonBrowsers = false;
+
+    bool Ignores(const std::wstring& appId, const std::wstring& appName) const;
+    bool IsBrowser(const std::wstring& appId, const std::wstring& appName) const;
+};
+
 // Follows the Windows media sessions (GlobalSystemMediaTransportControls).
 //
 // All decisions run on one worker thread: Windows' event callbacks only wake
@@ -64,6 +74,8 @@ public:
     void Send(MediaCommand command);
     // Shows the next (+1) or previous (-1) media session. Returns immediately.
     void SwitchSession(int direction);
+    // Applies new ignore/browser rules and re-picks the shown session.
+    void SetFilter(AppFilter filter);
     // Pixel size to decode cover art at; applies from the next track.
     void SetArtSize(UINT pixels) { artSize_ = pixels; }
 
@@ -90,5 +102,6 @@ private:
     HANDLE wakeEvent_ = nullptr;
     std::mutex mutex_;
     MediaInfo latest_;
+    AppFilter filter_;
     std::thread thread_;
 };

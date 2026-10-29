@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cwctype>
 #include <map>
 
 using Microsoft::WRL::ComPtr;
@@ -31,6 +32,8 @@ constexpr DWORD kCoalesceMs = 50;
 struct Tracked {
     Session session{nullptr};
     std::wstring appId;
+    std::wstring appName;
+    bool isBrowser = false;
     std::wstring title;
     std::wstring artist;
     std::shared_ptr<const MediaArt> art;
@@ -216,6 +219,34 @@ void MediaWatcher::Send(MediaCommand command) {
     SetEvent(wakeEvent_);
 }
 
+void MediaWatcher::SetFilter(AppFilter filter) {
+    {
+        std::lock_guard lock(mutex_);
+        filter_ = std::move(filter);
+    }
+    needsFullEvaluation_ = true;
+    SetEvent(wakeEvent_);
+}
+
+bool AppFilter::Ignores(const std::wstring& appId, const std::wstring& appName) const {
+    for (const auto& entry : ignored) {
+        if (_wcsicmp(entry.c_str(), appId.c_str()) == 0 || _wcsicmp(entry.c_str(), appName.c_str()) == 0) return true;
+    }
+    return false;
+}
+
+bool AppFilter::IsBrowser(const std::wstring& appId, const std::wstring& appName) const {
+    auto contains = [](const std::wstring& text, const std::wstring& part) {
+        return !part.empty() && std::search(text.begin(), text.end(), part.begin(), part.end(), [](wchar_t a, wchar_t b) {
+                                    return towlower(a) == towlower(b);
+                                }) != text.end();
+    };
+    for (const auto& browser : browsers) {
+        if (contains(appId, browser) || contains(appName, browser)) return true;
+    }
+    return false;
+}
+
 void MediaWatcher::SwitchSession(int direction) {
     pendingSwitch_ += direction;
     needsFullEvaluation_ = true;
@@ -246,6 +277,11 @@ void MediaWatcher::Run() {
         // App icons are looked up once per app (and size), then reused. Null = none found.
         std::map<std::pair<std::wstring, UINT>, std::shared_ptr<const MediaArt>> appIcons;
         std::map<std::wstring, std::wstring> appNames; // same: looked up once per app
+        auto nameOf = [&](const std::wstring& appId) {
+            auto name = appNames.find(appId);
+            if (name == appNames.end()) name = appNames.emplace(appId, AppDisplayName(appId)).first;
+            return name->second;
+        };
 
         HANDLE waits[] = {stopEvent_, wakeEvent_};
         while (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
@@ -279,18 +315,30 @@ void MediaWatcher::Run() {
                 continue;
             }
 
-            // Keep one subscription per live session; drop the ones that closed.
+            AppFilter filter;
+            {
+                std::lock_guard lock(mutex_);
+                filter = filter_;
+            }
+
+            // Keep one subscription per live session; drop the ones that closed
+            // and the ones the user chose to ignore.
             std::vector<Tracked> next;
             for (const auto& session : manager.GetSessions()) {
                 auto it = std::find_if(tracked.begin(), tracked.end(),
                                        [&](const Tracked& t) { return t.session == session; });
                 if (it != tracked.end()) {
+                    if (filter.Ignores(it->appId, it->appName)) continue;
+                    it->isBrowser = filter.IsBrowser(it->appId, it->appName);
                     next.push_back(std::move(*it));
                     continue;
                 }
                 Tracked t;
                 t.session = session;
                 t.appId = session.SourceAppUserModelId();
+                t.appName = nameOf(t.appId);
+                if (filter.Ignores(t.appId, t.appName)) continue;
+                t.isBrowser = filter.IsBrowser(t.appId, t.appName);
                 t.propertiesChanged = session.MediaPropertiesChanged(
                     winrt::auto_revoke, [this, stale = t.propertiesStale](auto&&, auto&&) {
                         *stale = true;
@@ -316,15 +364,19 @@ void MediaWatcher::Run() {
                 pickedAt = playCounter;
             }
 
-            // Most recently started playing wins.
+            // Most recently started playing wins. With "prefer non-browsers",
+            // any other playing app beats a browser first.
             Tracked* best = nullptr;
             Tracked* pick = nullptr;
             uint64_t newestStart = 0;
+            auto rank = [&](const Tracked& t) {
+                return std::make_pair(filter.preferNonBrowsers && !t.isBrowser, t.playingSince);
+            };
             for (auto& t : tracked) {
                 bool wasPlaying = t.wasPlaying;
                 ReadPlayback(t);
                 if (t.wasPlaying && !wasPlaying) t.playingSince = ++playCounter;
-                if (t.wasPlaying && (!best || t.playingSince > best->playingSince)) best = &t;
+                if (t.wasPlaying && (!best || rank(t) > rank(*best))) best = &t;
                 if (t.wasPlaying) newestStart = std::max(newestStart, t.playingSince);
                 if (picked && t.session == picked) pick = &t;
             }
@@ -369,9 +421,7 @@ void MediaWatcher::Run() {
                     icon = appIcons.emplace(key, LoadAppIcon(wic.Get(), best->appId, iconSize)).first;
                 }
                 info.appIcon = icon->second;
-                auto name = appNames.find(best->appId);
-                if (name == appNames.end()) name = appNames.emplace(best->appId, AppDisplayName(best->appId)).first;
-                info.appName = name->second;
+                info.appName = best->appName;
                 info.playing = best->wasPlaying;
                 info.canPrevious = best->canPrevious;
                 info.canPlayPause = best->canPlayPause;
