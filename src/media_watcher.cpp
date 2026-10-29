@@ -1,9 +1,9 @@
 #include "media_watcher.h"
+#include "app_info.h"
 #include <unknwn.h> // before C++/WinRT, so winrt::get_unknown interops with classic COM
 #include <ole2.h>
 #include <shcore.h>
 #include <shobjidl.h>
-#include <tlhelp32.h>
 #include <wincodec.h>
 #include <wrl/client.h>
 #include <winrt/Windows.Foundation.h>
@@ -115,25 +115,6 @@ std::shared_ptr<const MediaArt> ToArt(IWICImagingFactory* wic, IWICBitmapSource*
     return art;
 }
 
-// Full path of a running process with this exe name, or empty.
-std::wstring RunningExePath(const std::wstring& exeName) {
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) return {};
-    std::wstring path;
-    PROCESSENTRY32W entry{sizeof(entry)};
-    for (BOOL ok = Process32FirstW(snapshot, &entry); ok && path.empty(); ok = Process32NextW(snapshot, &entry)) {
-        if (_wcsicmp(entry.szExeFile, exeName.c_str()) != 0) continue;
-        if (HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ProcessID)) {
-            wchar_t buffer[MAX_PATH];
-            DWORD length = MAX_PATH;
-            if (QueryFullProcessImageNameW(process, 0, buffer, &length)) path.assign(buffer, length);
-            CloseHandle(process);
-        }
-    }
-    CloseHandle(snapshot);
-    return path;
-}
-
 // Decodes the thumbnail, scaled so its short side is `size`, center-cropped square.
 std::shared_ptr<const MediaArt> DecodeThumbnail(IWICImagingFactory* wic, const IRandomAccessStreamReference& ref,
                                                 UINT size) {
@@ -160,12 +141,7 @@ std::shared_ptr<const MediaArt> DecodeThumbnail(IWICImagingFactory* wic, const I
 // so for those the running exe's icon is used.
 std::shared_ptr<const MediaArt> LoadAppIcon(IWICImagingFactory* wic, const std::wstring& appId, UINT size) {
     if (!wic || appId.empty() || size == 0) return nullptr;
-    std::wstring parsingName;
-    if (appId.size() > 4 && _wcsicmp(appId.c_str() + appId.size() - 4, L".exe") == 0) {
-        parsingName = RunningExePath(appId);
-    } else {
-        parsingName = L"shell:AppsFolder\\" + appId;
-    }
+    const std::wstring parsingName = AppShellName(appId);
     ComPtr<IShellItemImageFactory> factory;
     HBITMAP icon = nullptr;
     if (parsingName.empty() ||
@@ -269,6 +245,7 @@ void MediaWatcher::Run() {
         uint64_t pickedAt = 0;
         // App icons are looked up once per app (and size), then reused. Null = none found.
         std::map<std::pair<std::wstring, UINT>, std::shared_ptr<const MediaArt>> appIcons;
+        std::map<std::wstring, std::wstring> appNames; // same: looked up once per app
 
         HANDLE waits[] = {stopEvent_, wakeEvent_};
         while (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
@@ -392,6 +369,9 @@ void MediaWatcher::Run() {
                     icon = appIcons.emplace(key, LoadAppIcon(wic.Get(), best->appId, iconSize)).first;
                 }
                 info.appIcon = icon->second;
+                auto name = appNames.find(best->appId);
+                if (name == appNames.end()) name = appNames.emplace(best->appId, AppDisplayName(best->appId)).first;
+                info.appName = name->second;
                 info.playing = best->wasPlaying;
                 info.canPrevious = best->canPrevious;
                 info.canPlayPause = best->canPlayPause;

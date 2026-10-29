@@ -18,6 +18,7 @@
 #include <cstring>
 #include <cwchar>
 #include <vector>
+#include "app_info.h"
 #include "media_watcher.h"
 #include "taskbar_watcher.h"
 
@@ -70,6 +71,7 @@ constexpr wchar_t kGlyphSwitchApp = 0xE76C; // chevron, like Windows' own media 
 
 // kButtonSwitchApp only exists while two or more apps have media.
 enum Button { kButtonPrevious, kButtonPlayPause, kButtonNext, kButtonSwitchApp, kButtonCount, kNoButton = -1 };
+constexpr int kPressedArt = 100; // g.pressed value while the cover art is held down
 
 struct WidgetLayout {
     D2D1_RECT_F art;
@@ -320,6 +322,13 @@ bool ButtonEnabled(int button) {
     case kButtonSwitchApp: return g.nowPlaying.sessionCount > 1;
     }
     return false;
+}
+
+bool HitArt(POINT pt) {
+    const float w = static_cast<float>(g.placed.right - g.placed.left);
+    const float h = static_cast<float>(g.placed.bottom - g.placed.top);
+    const auto r = ComputeLayout(w, h).art;
+    return pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom;
 }
 
 int HitButton(POINT pt) {
@@ -908,19 +917,26 @@ LRESULT CALLBACK WidgetProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             Render();
         }
         return 0;
-    case WM_LBUTTONDOWN:
-        g.pressed = HitButton({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+    case WM_LBUTTONDOWN: {
+        const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        g.pressed = HitButton(pt);
+        if (g.pressed == kNoButton && HitArt(pt) && !g.nowPlaying.appId.empty()) g.pressed = kPressedArt;
         if (g.pressed != kNoButton) {
             SetCapture(hwnd);
             Render();
         }
         return 0;
+    }
     case WM_LBUTTONUP: {
-        int released = HitButton({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+        const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        int released = HitButton(pt);
         int pressedButton = g.pressed;
         g.pressed = kNoButton;
         if (GetCapture() == hwnd) ReleaseCapture();
-        if (pressedButton != kNoButton && released == pressedButton && ButtonEnabled(released)) {
+        if (pressedButton == kPressedArt && HitArt(pt)) {
+            // Clicking the cover jumps to the app that's playing.
+            if (!ActivateApp(g.nowPlaying.appId)) Log(L"Couldn't bring %s forward", g.nowPlaying.appId.c_str());
+        } else if (pressedButton != kNoButton && released == pressedButton && ButtonEnabled(released)) {
             if (released == kButtonSwitchApp) {
                 g.media.SwitchSession(+1);
             } else {
@@ -1067,6 +1083,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     HANDLE singleInstance = CreateMutexW(nullptr, TRUE, L"TaskbarMedia.SingleInstance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
+    // The UI thread uses the shell (app windows, launching) and Core Audio (volume).
+    const HRESULT comInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     OpenLog();
     g.instance = instance;
     g.lightTheme = ReadLightTheme();
@@ -1112,5 +1130,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     FreeBitmap();
     if (g.log) fclose(g.log);
     if (singleInstance) CloseHandle(singleInstance);
+    if (SUCCEEDED(comInit)) CoUninitialize();
     return 0;
 }

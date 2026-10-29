@@ -17,7 +17,8 @@ struct MediaArt {
 
 // What the widget shows. Empty appId means no media session exists.
 struct MediaInfo {
-    std::wstring appId; // e.g. "Spotify.exe" or a browser's AppUserModelID
+    std::wstring appId;   // e.g. "Spotify.exe" or a browser's AppUserModelID
+    std::wstring appName; // e.g. "Spotify", "Helium"
     std::wstring title;
     std::wstring artist;
     std::shared_ptr<const MediaArt> art;     // null when the app gives none
