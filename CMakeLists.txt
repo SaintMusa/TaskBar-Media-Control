@@ -11,6 +11,7 @@ add_executable(TaskbarMedia WIN32
     src/app_info.cpp
     src/taskbar_watcher.cpp
     src/media_watcher.cpp
+    src/settings.cpp
     src/app.manifest
 )
 

@@ -20,6 +20,7 @@
 #include <vector>
 #include "app_info.h"
 #include "media_watcher.h"
+#include "settings.h"
 #include "taskbar_watcher.h"
 
 using Microsoft::WRL::ComPtr;
@@ -35,13 +36,21 @@ enum : UINT {
     WM_APP_MEDIA,                 // what's playing changed
     WM_APP_APPBAR,                // shell notifications (full screen apps)
 };
-enum : UINT_PTR { kTimerRelayout = 1, kTimerAttachRetry, kTimerProgress, kTimerIdleHide, kTimerWheelRest, kTimerMarquee };
-enum : UINT { kCmdExit = 1 };
+enum : UINT_PTR {
+    kTimerRelayout = 1,
+    kTimerAttachRetry,
+    kTimerProgress,
+    kTimerIdleHide,
+    kTimerWheelRest,
+    kTimerMarquee,
+    kTimerSettingsReload,
+};
+enum : UINT { kCmdExit = 1, kCmdStayVisible, kCmdStartWithWindows, kCmdOpenSettings };
 
 constexpr UINT kRelayoutDelayMs = 120; // coalesces bursts while icons animate
 constexpr UINT kAttachRetryMs = 1000;  // only while Explorer is (re)starting
-constexpr UINT kIdleHideMs = 30000;    // paused this long: get out of the way
 constexpr UINT kWheelRestMs = 300;     // wheel quiet this long = the scroll gesture ended
+constexpr UINT kSettingsSettleMs = 200; // editors save in several writes; reload once after
 constexpr int kPreferredWidth = 300;   // all sizes in DIPs (96 DPI pixels)
 constexpr int kMinWidth = 160;
 constexpr int kMargin = 8;
@@ -134,7 +143,8 @@ struct State {
 
     bool fits = false;       // the taskbar has room for us
     bool fullscreen = false; // a full screen app or game is in front
-    bool idleHidden = false; // media has been paused for kIdleHideMs
+    bool idleHidden = false; // media has been paused for settings.hideAfterPausedSeconds
+    Settings settings;
 
     HDC memDC = nullptr;
     HBITMAP bitmap = nullptr;
@@ -861,12 +871,13 @@ void OnMediaChanged() {
         Log(L"Media: [%s] %s — %s (%s%s)", m.appId.c_str(), m.title.c_str(), m.artist.c_str(),
             m.playing ? L"playing" : L"paused", m.hasTimeline ? L", has timeline" : L"");
     }
-    // Paused for a while hides the widget; playing brings it straight back.
-    if (m.playing) {
+    // Paused for a while hides the widget (unless the settings say stay);
+    // playing brings it straight back.
+    if (m.playing || g.settings.stayVisibleWhenPaused) {
         KillTimer(g.controller, kTimerIdleHide);
         g.idleHidden = false;
     } else if (!g.idleHidden && (previous.playing || m.appId != previous.appId)) {
-        SetTimer(g.controller, kTimerIdleHide, kIdleHideMs, nullptr);
+        SetTimer(g.controller, kTimerIdleHide, g.settings.hideAfterPausedSeconds * 1000, nullptr);
     }
     UpdateVisibility();
 
@@ -878,9 +889,31 @@ void OnMediaChanged() {
     Render(sameTimeline == previous ? Redraw::Seekbar : Redraw::Full);
 }
 
+// Takes new settings (from the menu or an edit of the file) into effect.
+void ApplySettings(const Settings& next) {
+    g.settings = next;
+    if (g.settings.stayVisibleWhenPaused) {
+        KillTimer(g.controller, kTimerIdleHide);
+        g.idleHidden = false;
+    } else if (!g.nowPlaying.playing && !g.idleHidden && !g.nowPlaying.appId.empty()) {
+        SetTimer(g.controller, kTimerIdleHide, g.settings.hideAfterPausedSeconds * 1000, nullptr);
+    }
+    UpdateVisibility();
+}
+
+void OpenSettingsFile() {
+    ShellExecuteW(nullptr, L"open", L"notepad.exe", (L"\"" + SettingsPath() + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
+}
+
 void ShowMenu() {
     HMENU menu = CreatePopupMenu();
+    const auto checked = [](bool on) { return MF_STRING | (on ? MF_CHECKED : MF_UNCHECKED); };
+    AppendMenuW(menu, checked(g.settings.stayVisibleWhenPaused), kCmdStayVisible, L"Stay visible when paused");
+    AppendMenuW(menu, checked(StartsWithWindows()), kCmdStartWithWindows, L"Start with Windows");
+    AppendMenuW(menu, MF_STRING, kCmdOpenSettings, L"Open settings file");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kCmdExit, L"Exit TaskbarMedia");
+
     POINT pt;
     GetCursorPos(&pt);
     SetForegroundWindow(g.controller); // so the menu closes when clicking elsewhere
@@ -888,7 +921,19 @@ void ShowMenu() {
                               nullptr);
     PostMessageW(g.controller, WM_NULL, 0, 0);
     DestroyMenu(menu);
-    if (cmd == kCmdExit) DestroyWindow(g.controller);
+
+    switch (cmd) {
+    case kCmdStayVisible: {
+        Settings next = g.settings;
+        next.stayVisibleWhenPaused = !next.stayVisibleWhenPaused;
+        SaveSettings(next);
+        ApplySettings(next);
+        break;
+    }
+    case kCmdStartWithWindows: SetStartWithWindows(!StartsWithWindows()); break;
+    case kCmdOpenSettings: OpenSettingsFile(); break;
+    case kCmdExit: DestroyWindow(g.controller); break;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1035,6 +1080,11 @@ LRESULT CALLBACK ControllerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g.wheelGesture = false;
         } else if (wp == kTimerMarquee) {
             OnMarqueeTick();
+        } else if (wp == kTimerSettingsReload) {
+            if (Settings next = LoadSettings(); !(next == g.settings)) {
+                Log(L"Settings file changed; applying");
+                ApplySettings(next);
+            }
         }
         return 0;
     case WM_SETTINGCHANGE:
@@ -1064,8 +1114,8 @@ LRESULT CALLBACK ControllerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 average(g.seekbarTicks, g.seekbarRenders), g.marqueeRenders,
                 average(g.marqueeTicks, g.marqueeRenders), average(g.presentTicks, total));
         }
-        for (UINT_PTR timer :
-             {kTimerRelayout, kTimerAttachRetry, kTimerProgress, kTimerIdleHide, kTimerWheelRest, kTimerMarquee}) {
+        for (UINT_PTR timer : {kTimerRelayout, kTimerAttachRetry, kTimerProgress, kTimerIdleHide, kTimerWheelRest,
+                               kTimerMarquee, kTimerSettingsReload}) {
             KillTimer(hwnd, timer);
         }
         UnregisterAppBar();
@@ -1087,6 +1137,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     const HRESULT comInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     OpenLog();
     g.instance = instance;
+    g.settings = LoadSettings();
     g.lightTheme = ReadLightTheme();
     g.taskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
 
@@ -1114,11 +1165,32 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     RegisterAppBar();
     Attach();
 
+    // Windows signals this handle when the settings folder changes, so hand
+    // edits apply on save without polling the file.
+    const std::wstring settingsPath = SettingsPath();
+    HANDLE settingsChanged = FindFirstChangeNotificationW(
+        settingsPath.substr(0, settingsPath.find_last_of(L'\\')).c_str(), FALSE, FILE_NOTIFY_CHANGE_LAST_WRITE);
+    if (settingsChanged == INVALID_HANDLE_VALUE) settingsChanged = nullptr;
+
     MSG msg;
-    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
+    for (bool running = true; running;) {
+        const DWORD woke = MsgWaitForMultipleObjectsEx(settingsChanged ? 1 : 0, &settingsChanged, INFINITE,
+                                                       QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        if (settingsChanged && woke == WAIT_OBJECT_0) {
+            FindNextChangeNotification(settingsChanged);
+            SetTimer(g.controller, kTimerSettingsReload, kSettingsSettleMs, nullptr);
+            continue;
+        }
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) {
+                running = false;
+                break;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
     }
+    if (settingsChanged) FindCloseChangeNotification(settingsChanged);
 
     g.media.Stop();
     g.watcher.Stop();
