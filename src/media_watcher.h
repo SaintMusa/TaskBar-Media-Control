@@ -35,6 +35,7 @@ struct MediaInfo {
     std::wstring artist;
     std::shared_ptr<const MediaArt> art;     // null when the app gives none
     std::shared_ptr<const MediaArt> appIcon; // the playing app's own icon, null if not found
+    std::shared_ptr<const MediaArt> largeArt; // the cover at pop-up size, only while it's open
     // The cover's main color as hue (0-360) and saturation (0-1), for tinting.
     // Absent for grey or black-and-white covers and when there's no art.
     bool hasAccent = false;
@@ -113,6 +114,8 @@ public:
     void SetFilter(AppFilter filter);
     // Pixel size to decode cover art at; applies from the next track.
     void SetArtSize(UINT pixels) { artSize_ = pixels; }
+    // Also decode the cover at this size (for the pop-up); 0 drops it again.
+    void SetLargeArtSize(UINT pixels);
 
     // How many times the worker woke up, and how many of those were the cheap
     // timeline-only kind (for measuring).
@@ -132,6 +135,7 @@ private:
     std::atomic<int> pendingSwitch_{0};
     std::atomic<int64_t> pendingSeekMs_{-1}; // -1 = no seek waiting
     std::atomic<UINT> artSize_{32};
+    std::atomic<UINT> largeArtSize_{0};
     HWND notifyWnd_ = nullptr;
     UINT changedMsg_ = 0;
     HANDLE stopEvent_ = nullptr;

@@ -1,19 +1,44 @@
 #include "popup.h"
-#include <d2d1.h>
+#include <windowsx.h>
 #include <dwmapi.h>
 #include <dwrite.h>
 #include <wrl/client.h>
 #include <algorithm>
-#include <vector>
+#include <cmath>
+#include <cwchar>
+#include <string>
 
 using Microsoft::WRL::ComPtr;
 
 namespace {
 
 constexpr wchar_t kPopupClass[] = L"TaskbarMedia.Popup";
-constexpr int kWidth = 320;        // DIPs
-constexpr int kHeight = 200;       // step 1: a fixed test size
+
+// Layout, in DIPs (96 DPI pixels), top to bottom.
+constexpr int kWidth = 320;
+constexpr int kPad = 16;
+constexpr int kHeaderTop = 14, kHeaderHeight = 20, kHeaderIcon = 16;
+constexpr int kArtTop = 46, kArtSize = 176, kArtRadius = 8;
+constexpr int kTitleTop = 234, kTitleHeight = 22;
+constexpr int kArtistTop = 256, kArtistHeight = 18;
+constexpr int kSeekCenter = 290, kSeekHitHeight = 20, kSeekThickness = 4, kSeekHoverThickness = 6, kThumb = 12;
+constexpr int kTimesTop = 297, kTimesHeight = 14;
+constexpr int kControlsTop = 316, kButton = 40, kPlayButton = 48, kButtonGap = 6, kButtonRadius = 6;
+constexpr int kHeight = 372;
 constexpr int kGapAboveTaskbar = 12; // like Windows' own flyouts
+
+constexpr int64_t kWheelSeekMs = 5000;
+constexpr UINT_PTR kTimerProgress = 1;
+
+// Segoe Fluent Icons code points.
+constexpr wchar_t kGlyphShuffle = 0xE8B1;
+constexpr wchar_t kGlyphPrevious = 0xE892;
+constexpr wchar_t kGlyphPlay = 0xE768;
+constexpr wchar_t kGlyphPause = 0xE769;
+constexpr wchar_t kGlyphNext = 0xE893;
+constexpr wchar_t kGlyphRepeatAll = 0xE8EE;
+constexpr wchar_t kGlyphRepeatOne = 0xE8ED;
+constexpr wchar_t kGlyphMusic = 0xE8D6;
 
 // DWM attributes newer than some SDK headers.
 constexpr DWORD kUseImmersiveDarkMode = 20;  // DWMWA_USE_IMMERSIVE_DARK_MODE
@@ -22,23 +47,148 @@ constexpr DWORD kSystemBackdropType = 38;    // DWMWA_SYSTEMBACKDROP_TYPE
 constexpr int kCornerRound = 2;              // DWMWCP_ROUND
 constexpr int kBackdropTransientWindow = 3;  // DWMSBT_TRANSIENTWINDOW: acrylic, as in flyouts
 
+// Everything the mouse can point at.
+enum class Hit { None, Header, Art, Seek, Shuffle, Previous, PlayPause, Next, Repeat };
+constexpr Hit kControls[] = {Hit::Shuffle, Hit::Previous, Hit::PlayPause, Hit::Next, Hit::Repeat};
+
 struct PopupState {
     HWND hwnd = nullptr;
     UINT dpi = 96;
     bool lightTheme = false;
     ULONGLONG closedAt = 0;
+    PopupHost host;
+
+    Hit hovered = Hit::None;
+    Hit pressed = Hit::None;
+    bool trackingMouse = false;
+    bool dragging = false;     // the seekbar thumb is held
+    double dragFraction = 0;   // where it's held, 0..1
 
     ComPtr<ID2D1Factory> d2d;
     ComPtr<IDWriteFactory> dwrite;
     ComPtr<ID2D1DCRenderTarget> target;
-    ComPtr<IDWriteTextFormat> textFormat;
+    ComPtr<IDWriteTextFormat> titleFormat, artistFormat, headerFormat, timeLeftFormat, timeRightFormat;
+    ComPtr<IDWriteTextFormat> iconFormat, playIconFormat, placeholderFormat;
+    ComPtr<ID2D1Bitmap> largeArt, smallArt, icon;
+    const MediaArt *largeArtSource = nullptr, *smallArtSource = nullptr, *iconSource = nullptr;
     HDC memDC = nullptr;
     HBITMAP bitmap = nullptr;
     HGDIOBJ oldBitmap = nullptr;
     SIZE bitmapSize{};
 } p;
 
+float S(float dip) { return dip * p.dpi / 96.0f; }
 int Scale(int dip) { return MulDiv(dip, static_cast<int>(p.dpi), 96); }
+
+D2D1_COLOR_F Ink(float alpha) {
+    return p.lightTheme ? D2D1::ColorF(0, 0, 0, alpha) : D2D1::ColorF(1, 1, 1, alpha);
+}
+
+int64_t NowFileTime() {
+    FILETIME ft;
+    GetSystemTimePreciseAsFileTime(&ft);
+    return (static_cast<int64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+}
+
+std::wstring FormatTime(int64_t ms) {
+    const int64_t total = std::max<int64_t>(ms, 0) / 1000;
+    wchar_t text[32];
+    if (total >= 3600) {
+        swprintf_s(text, L"%lld:%02lld:%02lld", total / 3600, total / 60 % 60, total % 60);
+    } else {
+        swprintf_s(text, L"%lld:%02lld", total / 60, total % 60);
+    }
+    return text;
+}
+
+// --- Layout ----------------------------------------------------------------
+
+D2D1_RECT_F ArtRect() {
+    const float left = (S(kWidth) - S(kArtSize)) / 2;
+    return D2D1::RectF(left, S(kArtTop), left + S(kArtSize), S(kArtTop) + S(kArtSize));
+}
+
+D2D1_RECT_F HeaderRect() {
+    return D2D1::RectF(S(kPad), S(kHeaderTop), S(kWidth) - S(kPad), S(kHeaderTop) + S(kHeaderHeight));
+}
+
+D2D1_RECT_F SeekTrack() {
+    return D2D1::RectF(S(kPad), S(kSeekCenter) - S(kSeekThickness) / 2, S(kWidth) - S(kPad),
+                       S(kSeekCenter) + S(kSeekThickness) / 2);
+}
+
+D2D1_RECT_F SeekHitRect() {
+    const auto track = SeekTrack();
+    return D2D1::RectF(track.left - S(6), S(kSeekCenter) - S(kSeekHitHeight) / 2, track.right + S(6),
+                       S(kSeekCenter) + S(kSeekHitHeight) / 2);
+}
+
+D2D1_RECT_F ControlRect(Hit control) {
+    const float total = S(kButton) * 4 + S(kPlayButton) + S(kButtonGap) * 4;
+    float x = (S(kWidth) - total) / 2;
+    for (Hit c : kControls) {
+        const float size = c == Hit::PlayPause ? S(kPlayButton) : S(kButton);
+        const float top = S(kControlsTop) + (S(kPlayButton) - size) / 2;
+        if (c == control) return D2D1::RectF(x, top, x + size, top + size);
+        x += size + S(kButtonGap);
+    }
+    return {};
+}
+
+bool Contains(const D2D1_RECT_F& r, POINT pt) {
+    return pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom;
+}
+
+bool ControlEnabled(Hit control, const MediaInfo& m) {
+    switch (control) {
+    case Hit::Shuffle: return m.canShuffle;
+    case Hit::Previous: return m.canPrevious;
+    case Hit::PlayPause: return m.canPlayPause;
+    case Hit::Next: return m.canNext;
+    case Hit::Repeat: return m.canRepeat;
+    default: return false;
+    }
+}
+
+bool CanSeek(const MediaInfo& m) { return m.hasTimeline && m.canSeek && m.durationMs > 0; }
+
+Hit HitTest(POINT pt) {
+    const MediaInfo& m = p.host.media();
+    if (Contains(HeaderRect(), pt)) return Hit::Header;
+    if (Contains(ArtRect(), pt)) return Hit::Art;
+    if (m.hasTimeline && Contains(SeekHitRect(), pt)) return Hit::Seek;
+    for (Hit c : kControls) {
+        if (Contains(ControlRect(c), pt)) return c;
+    }
+    return Hit::None;
+}
+
+double FractionAt(int x) {
+    const auto track = SeekTrack();
+    return std::clamp((x - track.left) / (track.right - track.left), 0.0f, 1.0f);
+}
+
+// --- Drawing resources -----------------------------------------------------
+
+ComPtr<IDWriteTextFormat> MakeFormat(const wchar_t* family, DWRITE_FONT_WEIGHT weight, float sizeDip,
+                                     DWRITE_TEXT_ALIGNMENT align, bool ellipsis) {
+    ComPtr<IDWriteTextFormat> format;
+    if (FAILED(p.dwrite->CreateTextFormat(family, nullptr, weight, DWRITE_FONT_STYLE_NORMAL,
+                                          DWRITE_FONT_STRETCH_NORMAL, S(sizeDip), L"", &format))) {
+        return nullptr;
+    }
+    format->SetTextAlignment(align);
+    format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    if (ellipsis) {
+        ComPtr<IDWriteInlineObject> sign;
+        if (SUCCEEDED(p.dwrite->CreateEllipsisTrimmingSign(format.Get(), &sign))) {
+            DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
+            format->SetTrimming(&trimming, sign.Get());
+        }
+    }
+    return format;
+}
 
 void FreeGraphics() {
     if (p.memDC) {
@@ -50,7 +200,18 @@ void FreeGraphics() {
     p.bitmap = nullptr;
     p.oldBitmap = nullptr;
     p.bitmapSize = {};
-    p.textFormat.Reset();
+    p.largeArt.Reset();
+    p.smallArt.Reset();
+    p.icon.Reset();
+    p.largeArtSource = p.smallArtSource = p.iconSource = nullptr;
+    p.titleFormat.Reset();
+    p.artistFormat.Reset();
+    p.headerFormat.Reset();
+    p.timeLeftFormat.Reset();
+    p.timeRightFormat.Reset();
+    p.iconFormat.Reset();
+    p.playIconFormat.Reset();
+    p.placeholderFormat.Reset();
     p.target.Reset();
     p.dwrite.Reset();
     p.d2d.Reset();
@@ -69,14 +230,16 @@ bool EnsureGraphics(SIZE size) {
         if (FAILED(p.d2d->CreateDCRenderTarget(&props, &p.target))) return false;
         p.target->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
     }
-    if (!p.textFormat) {
-        if (FAILED(p.dwrite->CreateTextFormat(L"Segoe UI Variable Text", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
-                                              DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
-                                              16.0f * p.dpi / 96.0f, L"", &p.textFormat))) {
-            return false;
-        }
-        p.textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        p.textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    if (!p.titleFormat) {
+        constexpr wchar_t text[] = L"Segoe UI Variable Text", icons[] = L"Segoe Fluent Icons";
+        p.titleFormat = MakeFormat(text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 16, DWRITE_TEXT_ALIGNMENT_CENTER, true);
+        p.artistFormat = MakeFormat(text, DWRITE_FONT_WEIGHT_NORMAL, 13, DWRITE_TEXT_ALIGNMENT_CENTER, true);
+        p.headerFormat = MakeFormat(text, DWRITE_FONT_WEIGHT_NORMAL, 12, DWRITE_TEXT_ALIGNMENT_LEADING, true);
+        p.timeLeftFormat = MakeFormat(text, DWRITE_FONT_WEIGHT_NORMAL, 11, DWRITE_TEXT_ALIGNMENT_LEADING, false);
+        p.timeRightFormat = MakeFormat(text, DWRITE_FONT_WEIGHT_NORMAL, 11, DWRITE_TEXT_ALIGNMENT_TRAILING, false);
+        p.iconFormat = MakeFormat(icons, DWRITE_FONT_WEIGHT_NORMAL, 16, DWRITE_TEXT_ALIGNMENT_CENTER, false);
+        p.playIconFormat = MakeFormat(icons, DWRITE_FONT_WEIGHT_NORMAL, 22, DWRITE_TEXT_ALIGNMENT_CENTER, false);
+        p.placeholderFormat = MakeFormat(icons, DWRITE_FONT_WEIGHT_NORMAL, 48, DWRITE_TEXT_ALIGNMENT_CENTER, false);
     }
     if (!p.bitmap || p.bitmapSize.cx != size.cx || p.bitmapSize.cy != size.cy) {
         if (p.memDC) {
@@ -93,7 +256,147 @@ bool EnsureGraphics(SIZE size) {
         p.oldBitmap = SelectObject(p.memDC, p.bitmap);
         p.bitmapSize = size;
     }
-    return true;
+    return p.titleFormat && p.artistFormat && p.headerFormat && p.timeLeftFormat && p.timeRightFormat &&
+           p.iconFormat && p.playIconFormat && p.placeholderFormat;
+}
+
+// Uploads an image to a Direct2D bitmap once, when it changes.
+ID2D1Bitmap* Uploaded(const MediaArt* image, ComPtr<ID2D1Bitmap>& bitmap, const MediaArt*& uploadedFrom) {
+    if (image != uploadedFrom) {
+        bitmap.Reset();
+        uploadedFrom = image;
+        if (image) {
+            auto props = D2D1::BitmapProperties(
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+            p.target->CreateBitmap(D2D1::SizeU(image->size, image->size), image->pixels.data(), image->size * 4,
+                                   props, &bitmap);
+        }
+    }
+    return bitmap.Get();
+}
+
+// --- Drawing ---------------------------------------------------------------
+
+// Fills a rounded rect with an image, scaled to fit it.
+void FillWithImage(ID2D1Bitmap* image, const D2D1_RECT_F& rect, float radius) {
+    ComPtr<ID2D1BitmapBrush> brush;
+    if (FAILED(p.target->CreateBitmapBrush(image, &brush))) return;
+    const auto source = image->GetSize();
+    brush->SetInterpolationMode(D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+    brush->SetTransform(D2D1::Matrix3x2F::Scale((rect.right - rect.left) / source.width,
+                                                (rect.bottom - rect.top) / source.height) *
+                        D2D1::Matrix3x2F::Translation(rect.left, rect.top));
+    p.target->FillRoundedRectangle(D2D1::RoundedRect(rect, radius, radius), brush.Get());
+}
+
+void DrawText(const std::wstring& text, IDWriteTextFormat* format, const D2D1_RECT_F& rect,
+              ID2D1SolidColorBrush* brush) {
+    p.target->DrawTextW(text.c_str(), static_cast<UINT32>(text.size()), format, rect, brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP);
+}
+
+void DrawNowPlaying(const MediaInfo& m, ID2D1SolidColorBrush* paint) {
+    // Header: the app's icon and name, so it's clear where the sound comes from.
+    const auto header = HeaderRect();
+    float textLeft = header.left;
+    if (ID2D1Bitmap* icon = Uploaded(m.appIcon.get(), p.icon, p.iconSource)) {
+        const float top = header.top + (header.bottom - header.top - S(kHeaderIcon)) / 2;
+        p.target->DrawBitmap(icon, D2D1::RectF(header.left, top, header.left + S(kHeaderIcon), top + S(kHeaderIcon)),
+                             1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        textLeft += S(kHeaderIcon) + S(8);
+    }
+    paint->SetColor(Ink(p.hovered == Hit::Header ? 0.92f : 0.68f));
+    DrawText(m.appName.empty() ? m.appId : m.appName, p.headerFormat.Get(),
+             D2D1::RectF(textLeft, header.top, header.right, header.bottom), paint);
+
+    // The cover, big. While the full-size decode is still on its way, the
+    // widget's small copy stands in rather than an empty square.
+    const auto art = ArtRect();
+    const float radius = S(kArtRadius);
+    ID2D1Bitmap* cover = Uploaded(m.largeArt.get(), p.largeArt, p.largeArtSource);
+    if (!cover) cover = Uploaded(m.art.get(), p.smallArt, p.smallArtSource);
+    if (cover) {
+        FillWithImage(cover, art, radius);
+    } else {
+        paint->SetColor(Ink(0.08f));
+        p.target->FillRoundedRectangle(D2D1::RoundedRect(art, radius, radius), paint);
+        paint->SetColor(Ink(0.4f));
+        p.target->DrawTextW(&kGlyphMusic, 1, p.placeholderFormat.Get(), art, paint);
+    }
+    if (p.hovered == Hit::Art) { // a soft lift says "click me"
+        paint->SetColor(D2D1::ColorF(1, 1, 1, 0.08f));
+        p.target->FillRoundedRectangle(D2D1::RoundedRect(art, radius, radius), paint);
+    }
+
+    const float textAlpha = m.playing ? 0.95f : 0.7f;
+    paint->SetColor(Ink(textAlpha));
+    DrawText(m.title.empty() ? L"Untitled" : m.title, p.titleFormat.Get(),
+             D2D1::RectF(S(kPad), S(kTitleTop), S(kWidth) - S(kPad), S(kTitleTop) + S(kTitleHeight)), paint);
+    paint->SetColor(Ink(textAlpha * 0.65f));
+    DrawText(m.artist, p.artistFormat.Get(),
+             D2D1::RectF(S(kPad), S(kArtistTop), S(kWidth) - S(kPad), S(kArtistTop) + S(kArtistHeight)), paint);
+
+    // Seekbar with times. Live streams and apps that report no length skip it.
+    if (m.hasTimeline && m.durationMs > 0) {
+        const bool active = p.dragging || (p.hovered == Hit::Seek && CanSeek(m));
+        const double fraction = p.dragging ? p.dragFraction
+                                           : static_cast<double>(m.PositionAt(NowFileTime())) / m.durationMs;
+        auto track = SeekTrack();
+        if (active) {
+            const float grow = (S(kSeekHoverThickness) - S(kSeekThickness)) / 2;
+            track.top -= grow;
+            track.bottom += grow;
+        }
+        const float round = (track.bottom - track.top) / 2;
+        paint->SetColor(Ink(0.18f));
+        p.target->FillRoundedRectangle(D2D1::RoundedRect(track, round, round), paint);
+        auto filled = track;
+        filled.right = track.left + static_cast<float>((track.right - track.left) * fraction);
+        D2D1_COLOR_F color = p.host.accent();
+        paint->SetColor(color);
+        p.target->FillRoundedRectangle(D2D1::RoundedRect(filled, round, round), paint);
+        if (active) {
+            paint->SetColor(Ink(1.0f));
+            p.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(filled.right, S(kSeekCenter)), S(kThumb) / 2,
+                                                S(kThumb) / 2),
+                                  paint);
+        }
+        const int64_t shownMs = static_cast<int64_t>(fraction * m.durationMs);
+        const auto times = D2D1::RectF(S(kPad), S(kTimesTop), S(kWidth) - S(kPad), S(kTimesTop) + S(kTimesHeight));
+        paint->SetColor(Ink(0.58f));
+        DrawText(FormatTime(shownMs), p.timeLeftFormat.Get(), times, paint);
+        DrawText(FormatTime(m.durationMs), p.timeRightFormat.Get(), times, paint);
+    }
+
+    // Controls. Shuffle and repeat light up in the cover's color when on, and
+    // everything the app doesn't allow is drawn faint.
+    for (Hit c : kControls) {
+        const auto rect = ControlRect(c);
+        const bool enabled = ControlEnabled(c, m);
+        const bool on = (c == Hit::Shuffle && m.shuffle) || (c == Hit::Repeat && m.repeat != RepeatMode::Off);
+        if (enabled && p.hovered == c) {
+            paint->SetColor(Ink(p.pressed == c ? 0.05f : 0.08f));
+            p.target->FillRoundedRectangle(D2D1::RoundedRect(rect, S(kButtonRadius), S(kButtonRadius)), paint);
+        }
+        wchar_t glyph = 0;
+        switch (c) {
+        case Hit::Shuffle: glyph = kGlyphShuffle; break;
+        case Hit::Previous: glyph = kGlyphPrevious; break;
+        case Hit::PlayPause: glyph = m.playing ? kGlyphPause : kGlyphPlay; break;
+        case Hit::Next: glyph = kGlyphNext; break;
+        case Hit::Repeat: glyph = m.repeat == RepeatMode::One ? kGlyphRepeatOne : kGlyphRepeatAll; break;
+        default: break;
+        }
+        if (!enabled) paint->SetColor(Ink(0.32f));
+        else if (on) paint->SetColor(p.host.accent());
+        else paint->SetColor(Ink(p.pressed == c ? 0.7f : 0.95f));
+        p.target->DrawTextW(&glyph, 1, c == Hit::PlayPause ? p.playIconFormat.Get() : p.iconFormat.Get(), rect,
+                            paint);
+        if (enabled && on) { // a small dot under it, so "on" doesn't rely on color alone
+            const float cx = (rect.left + rect.right) / 2;
+            p.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, rect.bottom - S(5)), S(1.5f), S(1.5f)), paint);
+        }
+    }
 }
 
 // Draws into a premultiplied 32-bit bitmap and copies it to the window. With
@@ -107,16 +410,66 @@ void Paint(HDC windowDC) {
     RECT bounds{0, 0, size.cx, size.cy};
     if (FAILED(p.target->BindDC(p.memDC, &bounds))) return;
 
-    const auto ink = p.lightTheme ? D2D1::ColorF(0, 0, 0, 0.9f) : D2D1::ColorF(1, 1, 1, 0.92f);
-    ComPtr<ID2D1SolidColorBrush> text;
-    p.target->CreateSolidColorBrush(ink, &text);
+    ComPtr<ID2D1SolidColorBrush> paint;
+    p.target->CreateSolidColorBrush(Ink(1.0f), &paint);
     p.target->BeginDraw();
     p.target->Clear(D2D1::ColorF(0, 0, 0, 0));
-    constexpr wchar_t label[] = L"Pop-up test";
-    p.target->DrawTextW(label, static_cast<UINT32>(wcslen(label)), p.textFormat.Get(),
-                        D2D1::RectF(0, 0, static_cast<float>(size.cx), static_cast<float>(size.cy)), text.Get());
-    if (p.target->EndDraw() == D2DERR_RECREATE_TARGET) p.target.Reset();
+    if (paint) DrawNowPlaying(p.host.media(), paint.Get());
+    if (p.target->EndDraw() == D2DERR_RECREATE_TARGET) {
+        p.target.Reset();
+        p.largeArt.Reset();
+        p.smallArt.Reset();
+        p.icon.Reset();
+        p.largeArtSource = p.smallArtSource = p.iconSource = nullptr;
+    }
     BitBlt(windowDC, 0, 0, size.cx, size.cy, p.memDC, 0, 0, SRCCOPY);
+}
+
+void Redraw() {
+    if (p.hwnd) InvalidateRect(p.hwnd, nullptr, FALSE);
+}
+
+// While open and playing, redraws each time the seekbar grows by a pixel,
+// exactly like the widget's bar. Paused, dragging or no timeline: no timer.
+void ScheduleProgress() {
+    if (!p.hwnd) return;
+    KillTimer(p.hwnd, kTimerProgress);
+    const MediaInfo& m = p.host.media();
+    if (!m.playing || !m.hasTimeline || m.durationMs <= 0 || p.dragging) return;
+    const auto track = SeekTrack();
+    const double barPx = track.right - track.left;
+    const double position = static_cast<double>(m.PositionAt(NowFileTime()));
+    const double nextPixelAt = (std::floor(position * barPx / m.durationMs) + 1) * m.durationMs / barPx;
+    const double delayMs = (nextPixelAt - position) / m.rate;
+    SetTimer(p.hwnd, kTimerProgress, static_cast<UINT>(std::clamp(delayMs + 1, 100.0, 60000.0)), nullptr);
+}
+
+void Activate(Hit hit) {
+    const MediaInfo& m = p.host.media();
+    switch (hit) {
+    case Hit::Header:
+    case Hit::Art: p.host.openApp(); break; // the app taking focus closes the pop-up
+    case Hit::Shuffle: p.host.send(m.shuffle ? MediaCommand::ShuffleOff : MediaCommand::ShuffleOn); break;
+    case Hit::Previous: p.host.send(MediaCommand::Previous); break;
+    case Hit::PlayPause: p.host.send(MediaCommand::PlayPause); break;
+    case Hit::Next: p.host.send(MediaCommand::Next); break;
+    case Hit::Repeat: // off -> all -> one -> off, like most players
+        p.host.send(m.repeat == RepeatMode::Off   ? MediaCommand::RepeatAll
+                    : m.repeat == RepeatMode::All ? MediaCommand::RepeatOne
+                                                  : MediaCommand::RepeatOff);
+        break;
+    default: break;
+    }
+}
+
+bool Clickable(Hit hit, const MediaInfo& m) {
+    switch (hit) {
+    case Hit::Header:
+    case Hit::Art: return true;
+    case Hit::Seek: return CanSeek(m);
+    case Hit::None: return false;
+    default: return ControlEnabled(hit, m);
+    }
 }
 
 LRESULT CALLBACK PopupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -135,6 +488,99 @@ LRESULT CALLBACK PopupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
     case WM_NCHITTEST:
         return HTCLIENT; // no resizing from the edges the frame style would add
+    case WM_SETCURSOR:
+        if (LOWORD(lp) == HTCLIENT) {
+            POINT pt;
+            GetCursorPos(&pt);
+            ScreenToClient(hwnd, &pt);
+            const bool hand = Clickable(HitTest(pt), p.host.media()) || p.dragging;
+            SetCursor(LoadCursorW(nullptr, hand ? IDC_HAND : IDC_ARROW));
+            return TRUE;
+        }
+        break;
+    case WM_MOUSEMOVE: {
+        if (!p.trackingMouse) {
+            TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, hwnd, 0};
+            p.trackingMouse = TrackMouseEvent(&track);
+        }
+        const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        if (p.dragging) {
+            p.dragFraction = FractionAt(pt.x);
+            Redraw();
+            return 0;
+        }
+        const Hit hit = HitTest(pt);
+        if (hit != p.hovered) {
+            p.hovered = hit;
+            Redraw(); // only when what's under the mouse changes
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        p.trackingMouse = false;
+        if (p.hovered != Hit::None && !p.dragging) {
+            p.hovered = Hit::None;
+            Redraw();
+        }
+        return 0;
+    case WM_LBUTTONDOWN: {
+        const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        const Hit hit = HitTest(pt);
+        const MediaInfo& m = p.host.media();
+        if (!Clickable(hit, m)) return 0;
+        SetCapture(hwnd);
+        if (hit == Hit::Seek) {
+            p.dragging = true;
+            p.dragFraction = FractionAt(pt.x);
+            KillTimer(hwnd, kTimerProgress);
+        } else {
+            p.pressed = hit;
+        }
+        Redraw();
+        return 0;
+    }
+    case WM_LBUTTONUP: {
+        const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        if (GetCapture() == hwnd) ReleaseCapture();
+        const MediaInfo& m = p.host.media();
+        if (p.dragging) {
+            p.dragging = false;
+            p.host.seek(static_cast<int64_t>(FractionAt(pt.x) * m.durationMs));
+        } else if (p.pressed != Hit::None && HitTest(pt) == p.pressed) {
+            Activate(p.pressed);
+        }
+        p.pressed = Hit::None;
+        if (p.hwnd) {
+            Redraw();
+            ScheduleProgress();
+        }
+        return 0;
+    }
+    case WM_CAPTURECHANGED:
+        if (p.dragging || p.pressed != Hit::None) {
+            p.dragging = false;
+            p.pressed = Hit::None;
+            Redraw();
+            ScheduleProgress();
+        }
+        return 0;
+    case WM_MOUSEWHEEL: {
+        // Over the seekbar the wheel seeks: up is forward, like the widget's Shift+scroll.
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        ScreenToClient(hwnd, &pt);
+        const MediaInfo& m = p.host.media();
+        if (HitTest(pt) == Hit::Seek && CanSeek(m)) {
+            const int64_t step = kWheelSeekMs * GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA;
+            p.host.seek(std::clamp<int64_t>(m.PositionAt(NowFileTime()) + step, 0, m.durationMs));
+        }
+        return 0;
+    }
+    case WM_TIMER:
+        if (wp == kTimerProgress) {
+            Redraw();
+            ScheduleProgress();
+        }
+        return 0;
     case WM_ERASEBKGND:
         return 1; // Paint covers everything
     case WM_PAINT: {
@@ -146,9 +592,13 @@ LRESULT CALLBACK PopupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_DESTROY:
         if (hwnd == p.hwnd) {
+            KillTimer(hwnd, kTimerProgress);
             p.hwnd = nullptr;
             p.closedAt = GetTickCount64();
+            p.hovered = p.pressed = Hit::None;
+            p.dragging = p.trackingMouse = false;
             FreeGraphics(); // everything the pop-up used goes with it
+            if (p.host.closed) p.host.closed();
         }
         return 0;
     }
@@ -157,7 +607,7 @@ LRESULT CALLBACK PopupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 } // namespace
 
-void OpenPopup(HINSTANCE instance, HWND owner, const PopupPlacement& placement) {
+void OpenPopup(HINSTANCE instance, HWND owner, const PopupPlacement& placement, PopupHost host) {
     if (p.hwnd) return;
     static bool registered = [instance] {
         WNDCLASSEXW wc{sizeof(wc)};
@@ -169,6 +619,7 @@ void OpenPopup(HINSTANCE instance, HWND owner, const PopupPlacement& placement) 
     }();
     if (!registered) return;
 
+    p.host = std::move(host);
     p.dpi = placement.dpi;
     p.lightTheme = placement.lightTheme;
     const int width = Scale(kWidth), height = Scale(kHeight);
@@ -197,6 +648,7 @@ void OpenPopup(HINSTANCE instance, HWND owner, const PopupPlacement& placement) 
 
     ShowWindow(p.hwnd, SW_SHOW);
     SetForegroundWindow(p.hwnd); // so a click anywhere else closes it
+    ScheduleProgress();
 }
 
 void ClosePopup() {
@@ -204,5 +656,13 @@ void ClosePopup() {
 }
 
 bool PopupIsOpen() { return p.hwnd != nullptr; }
+
+void PopupRefresh() {
+    if (!p.hwnd || p.dragging) return; // a drag in progress keeps its own position
+    Redraw();
+    ScheduleProgress();
+}
+
+UINT PopupArtSize(UINT dpi) { return static_cast<UINT>(MulDiv(kArtSize, static_cast<int>(dpi), 96)); }
 
 ULONGLONG PopupClosedAt() { return p.closedAt; }

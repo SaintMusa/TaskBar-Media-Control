@@ -1022,6 +1022,7 @@ void OnMediaChanged() {
     }
     UpdateVisibility();
     UpdateTooltip();
+    PopupRefresh();
     // A different track (or app) cross-fades in, if the widget was already showing one.
     g.fadeNext = IsWindowVisible(g.widget) && !previous.appId.empty() &&
                  (m.appId != previous.appId || m.title != previous.title || m.art != previous.art);
@@ -1139,6 +1140,8 @@ void OpenSettingsFile() {
 // Clicking the widget opens the pop-up player above it, or closes it. A click
 // on the widget while the pop-up is open first takes focus from the pop-up,
 // which closes it; that same click mustn't reopen it a moment later.
+void SeekToMs(int64_t positionMs); // with the scroll handling below
+
 void TogglePopup() {
     if (PopupIsOpen()) {
         ClosePopup();
@@ -1151,7 +1154,15 @@ void TogglePopup() {
     GetWindowRect(g.taskbar, &placement.taskbar);
     placement.dpi = g.dpi;
     placement.lightTheme = g.lightTheme;
-    OpenPopup(g.instance, g.controller, placement);
+    PopupHost host;
+    host.media = []() -> const MediaInfo& { return g.nowPlaying; };
+    host.accent = [] { return SeekbarColor(g.nowPlaying); };
+    host.send = [](MediaCommand command) { g.media.Send(command); };
+    host.seek = [](int64_t positionMs) { SeekToMs(positionMs); };
+    host.openApp = [] { ActivateApp(g.nowPlaying.appId); };
+    host.closed = [] { g.media.SetLargeArtSize(0); }; // the big cover isn't kept around
+    g.media.SetLargeArtSize(PopupArtSize(g.dpi));
+    OpenPopup(g.instance, g.controller, placement, std::move(host));
 }
 
 // Briefly shows a line of feedback in place of the artist.
@@ -1186,6 +1197,18 @@ std::wstring FormatTime(int64_t ms) {
     return text;
 }
 
+// Moves the bar there at once; the app's own timeline report confirms it a
+// moment later. Used by Shift+scroll and the pop-up's seekbar.
+void SeekToMs(int64_t positionMs) {
+    MediaInfo& m = g.nowPlaying;
+    if (!m.canSeek || !m.hasTimeline) return;
+    m.positionMs = std::clamp<int64_t>(positionMs, 0, m.durationMs);
+    m.reportedAt = NowFileTime();
+    g.media.SeekTo(m.positionMs);
+    Render(Redraw::Seekbar);
+    PopupRefresh();
+}
+
 // Shift+scroll: jump 5 s per notch, for apps that allow seeking. The bar moves
 // at once; the app's own timeline report confirms it a moment later.
 void Seek(int wheelDelta) {
@@ -1195,12 +1218,9 @@ void Seek(int wheelDelta) {
         Flash(L"This app doesn't allow seeking");
         return;
     }
-    const int64_t now = NowFileTime();
-    const int64_t target =
-        std::clamp<int64_t>(m.PositionAt(now) + kSeekStepMs * wheelDelta / WHEEL_DELTA, 0, m.durationMs);
-    m.positionMs = target;
-    m.reportedAt = now;
-    g.media.SeekTo(target);
+    const int64_t target = std::clamp<int64_t>(m.PositionAt(NowFileTime()) + kSeekStepMs * wheelDelta / WHEEL_DELTA,
+                                               0, m.durationMs);
+    SeekToMs(target);
     Flash(FormatTime(target) + L" / " + FormatTime(m.durationMs));
 }
 

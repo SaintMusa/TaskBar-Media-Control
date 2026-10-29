@@ -41,6 +41,7 @@ struct Tracked {
     std::wstring title;
     std::wstring artist;
     std::shared_ptr<const MediaArt> art;
+    std::shared_ptr<const MediaArt> largeArt; // only while the pop-up wants it
     bool hasAccent = false;
     float accentHue = 0, accentSaturation = 0;
     // Set from Windows' callback thread when title/artist/art change. Browsers
@@ -273,6 +274,12 @@ MediaInfo MediaWatcher::Latest() {
 
 void MediaWatcher::Send(MediaCommand command) {
     pendingCommand_ = static_cast<int>(command);
+    SetEvent(wakeEvent_);
+}
+
+void MediaWatcher::SetLargeArtSize(UINT pixels) {
+    largeArtSize_ = pixels;
+    needsFullEvaluation_ = true;
     SetEvent(wakeEvent_);
 }
 
@@ -519,14 +526,25 @@ void MediaWatcher::Run() {
 
             MediaInfo info;
             if (best) {
-                if (best->propertiesStale->exchange(false)) {
+                // The big cover is decoded only while the pop-up is open, and
+                // dropped (memory freed) as soon as it closes.
+                const UINT largeSize = largeArtSize_;
+                for (auto& t : tracked) {
+                    if (!largeSize || &t != best) t.largeArt.reset();
+                }
+                const bool stale = best->propertiesStale->exchange(false);
+                const bool needsLarge = largeSize && (!best->largeArt || best->largeArt->size != largeSize);
+                if (stale || needsLarge) {
                     try {
                         if (auto props = best->session.TryGetMediaPropertiesAsync().get()) {
-                            best->title = props.Title();
-                            best->artist = props.Artist();
-                            best->art = DecodeThumbnail(wic.Get(), props.Thumbnail(), artSize_);
-                            best->hasAccent =
-                                best->art && FindAccent(*best->art, best->accentHue, best->accentSaturation);
+                            if (stale) {
+                                best->title = props.Title();
+                                best->artist = props.Artist();
+                                best->art = DecodeThumbnail(wic.Get(), props.Thumbnail(), artSize_);
+                                best->hasAccent =
+                                    best->art && FindAccent(*best->art, best->accentHue, best->accentSaturation);
+                            }
+                            if (largeSize) best->largeArt = DecodeThumbnail(wic.Get(), props.Thumbnail(), largeSize);
                         }
                     } catch (...) {
                         // The app closed mid-query; the next SessionsChanged sorts it out.
@@ -536,6 +554,7 @@ void MediaWatcher::Run() {
                 info.title = best->title;
                 info.artist = best->artist;
                 info.art = best->art;
+                info.largeArt = best->largeArt;
                 info.hasAccent = best->hasAccent;
                 info.accentHue = best->accentHue;
                 info.accentSaturation = best->accentSaturation;
