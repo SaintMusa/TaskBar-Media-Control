@@ -67,12 +67,14 @@ enum class MediaCommand { None, Previous, PlayPause, Next, ShuffleOn, ShuffleOff
 // Which apps to leave out, and which kinds of app win when several play.
 struct AppFilter {
     std::vector<std::wstring> ignored;  // exact app ID or name, ignoring case
+    std::wstring pinned;                // same matching; shown whenever it's open
     std::vector<std::wstring> musicApps; // any of these within the app ID or name
     std::vector<std::wstring> browsers;  // same
     bool preferMusicApps = true;
     bool preferNonBrowsers = false;
 
     bool Ignores(const std::wstring& appId, const std::wstring& appName) const;
+    bool IsPinned(const std::wstring& appId, const std::wstring& appName) const;
     bool IsMusicApp(const std::wstring& appId, const std::wstring& appName) const;
     bool IsBrowser(const std::wstring& appId, const std::wstring& appName) const;
 };

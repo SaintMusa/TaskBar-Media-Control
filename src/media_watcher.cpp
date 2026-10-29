@@ -260,6 +260,11 @@ void MediaWatcher::SetFilter(AppFilter filter) {
     SetEvent(wakeEvent_);
 }
 
+bool AppFilter::IsPinned(const std::wstring& appId, const std::wstring& appName) const {
+    return !pinned.empty() &&
+           (_wcsicmp(pinned.c_str(), appId.c_str()) == 0 || _wcsicmp(pinned.c_str(), appName.c_str()) == 0);
+}
+
 bool AppFilter::Ignores(const std::wstring& appId, const std::wstring& appName) const {
     for (const auto& entry : ignored) {
         if (_wcsicmp(entry.c_str(), appId.c_str()) == 0 || _wcsicmp(entry.c_str(), appName.c_str()) == 0) return true;
@@ -316,6 +321,7 @@ void MediaWatcher::Run() {
         // Set by scrolling. Holds until it closes or anything starts playing after the pick.
         Session picked{nullptr};
         uint64_t pickedAt = 0;
+        bool pickPlayed = false; // the picked app has played since it was picked
         // App icons are looked up once per app (and size), then reused. Null = none found.
         std::map<std::pair<std::wstring, UINT>, std::shared_ptr<const MediaArt>> appIcons;
         std::map<std::wstring, std::wstring> appNames; // same: looked up once per app
@@ -406,6 +412,7 @@ void MediaWatcher::Run() {
                 const int from = it == tracked.end() ? 0 : static_cast<int>(it - tracked.begin());
                 picked = tracked[((from + steps) % count + count) % count].session;
                 pickedAt = playCounter;
+                pickPlayed = false;
             }
             // Or a specific app chosen from the menu.
             std::wstring pickApp;
@@ -417,6 +424,7 @@ void MediaWatcher::Run() {
                 if (!pickApp.empty() && t.appId == pickApp) {
                     picked = t.session;
                     pickedAt = playCounter;
+                    pickPlayed = false;
                 }
             }
 
@@ -437,7 +445,20 @@ void MediaWatcher::Run() {
                 if (t.wasPlaying) newestStart = std::max(newestStart, t.playingSince);
                 if (picked && t.session == picked) pick = &t;
             }
-            if (pick && newestStart <= pickedAt) {
+            // A pinned app beats all of the above whenever it's open. Switching
+            // away from it still works, but only until the app switched to
+            // pauses after playing or closes, or the pinned app starts playing.
+            Tracked* pinned = nullptr;
+            for (auto& t : tracked) {
+                if (filter.IsPinned(t.appId, t.appName)) pinned = &t;
+            }
+            if (pick && pick->wasPlaying) pickPlayed = true;
+            if (pinned) {
+                const bool swapHolds = pick && pick != pinned && pinned->playingSince <= pickedAt &&
+                                       !(pickPlayed && !pick->wasPlaying);
+                best = swapHolds ? pick : pinned;
+                if (!swapHolds) picked = nullptr;
+            } else if (pick && newestStart <= pickedAt) {
                 best = pick;
             } else {
                 picked = nullptr;

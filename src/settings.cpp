@@ -25,6 +25,9 @@ constexpr wchar_t kTemplate[] =
     L"; Apps never to show, separated by ;  Use the name from the right-click\r\n"
     L"; menu (Spotify), an exe name (msedge.exe) or an app ID.\r\n"
     L"Ignore=\r\n"
+    L"; An app to keep on the widget whenever it's open, even while others play.\r\n"
+    L"; Switching away still works, until the app you switched to pauses.\r\n"
+    L"Pinned=\r\n"
     L"; 1 = while a music app is playing, show it over any other app.\r\n"
     L"PreferMusicApps=1\r\n"
     L"; What counts as a music app, separated by ;\r\n"
@@ -89,6 +92,7 @@ Settings LoadSettings() {
     s.stayVisibleWhenPaused = GetPrivateProfileIntW(L"General", L"StayVisibleWhenPaused", 0, path.c_str()) != 0;
     s.hideAfterPausedSeconds = GetPrivateProfileIntW(L"General", L"HideAfterPausedSeconds", 30, path.c_str());
     s.ignoredApps = SplitList(ReadString(L"Apps", L"Ignore", L""));
+    s.pinnedApp = ReadString(L"Apps", L"Pinned", L"");
     s.preferMusicApps = GetPrivateProfileIntW(L"Apps", L"PreferMusicApps", 1, path.c_str()) != 0;
     s.musicApps = SplitList(ReadString(L"Apps", L"MusicApps", kDefaultMusicApps));
     s.preferNonBrowsers = GetPrivateProfileIntW(L"Apps", L"PreferNonBrowsers", 0, path.c_str()) != 0;
@@ -104,6 +108,7 @@ void SaveSettings(const Settings& s) {
     WritePrivateProfileStringW(L"General", L"HideAfterPausedSeconds",
                                std::to_wstring(s.hideAfterPausedSeconds).c_str(), path.c_str());
     WritePrivateProfileStringW(L"Apps", L"Ignore", JoinList(s.ignoredApps).c_str(), path.c_str());
+    WritePrivateProfileStringW(L"Apps", L"Pinned", s.pinnedApp.c_str(), path.c_str());
     WritePrivateProfileStringW(L"Apps", L"PreferMusicApps", s.preferMusicApps ? L"1" : L"0", path.c_str());
     WritePrivateProfileStringW(L"Apps", L"MusicApps", JoinList(s.musicApps).c_str(), path.c_str());
     WritePrivateProfileStringW(L"Apps", L"PreferNonBrowsers", s.preferNonBrowsers ? L"1" : L"0", path.c_str());

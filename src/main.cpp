@@ -56,6 +56,8 @@ enum : UINT {
     kCmdRepeatOne,
     kCmdRepeatAll,
     kCmdIgnoreApp,
+    kCmdPinApp,
+    kCmdUnpin,
     kCmdPreferMusic,
     kCmdPreferNonBrowsers,
     kCmdStayVisible,
@@ -929,12 +931,13 @@ void OnMediaChanged() {
 }
 
 AppFilter FilterFrom(const Settings& s) {
-    return {s.ignoredApps, s.musicApps, s.browsers, s.preferMusicApps, s.preferNonBrowsers};
+    return {s.ignoredApps, s.pinnedApp, s.musicApps, s.browsers, s.preferMusicApps, s.preferNonBrowsers};
 }
 
 // Takes new settings (from the menu or an edit of the file) into effect.
 void ApplySettings(const Settings& next) {
-    const bool filterChanged = next.ignoredApps != g.settings.ignoredApps || next.musicApps != g.settings.musicApps ||
+    const bool filterChanged = next.ignoredApps != g.settings.ignoredApps || next.pinnedApp != g.settings.pinnedApp ||
+                               next.musicApps != g.settings.musicApps ||
                                next.browsers != g.settings.browsers ||
                                next.preferMusicApps != g.settings.preferMusicApps ||
                                next.preferNonBrowsers != g.settings.preferNonBrowsers;
@@ -1065,6 +1068,13 @@ void ShowMenu() {
     }
 
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    const bool shownIsPinned = !g.settings.pinnedApp.empty() &&
+                               (_wcsicmp(g.settings.pinnedApp.c_str(), name.c_str()) == 0 ||
+                                _wcsicmp(g.settings.pinnedApp.c_str(), m.appId.c_str()) == 0);
+    if (!m.appId.empty()) AppendMenuW(menu, checked(shownIsPinned), kCmdPinApp, (L"Pin " + name).c_str());
+    if (!g.settings.pinnedApp.empty() && !shownIsPinned) {
+        AppendMenuW(menu, MF_STRING, kCmdUnpin, (L"Unpin " + g.settings.pinnedApp).c_str());
+    }
     if (!m.appId.empty()) AppendMenuW(menu, MF_STRING, kCmdIgnoreApp, (L"Never show " + name).c_str());
     if (!g.settings.ignoredApps.empty()) {
         ignored = CreatePopupMenu();
@@ -1107,6 +1117,8 @@ void ShowMenu() {
     case kCmdRepeatOne: g.media.Send(MediaCommand::RepeatOne); break;
     case kCmdRepeatAll: g.media.Send(MediaCommand::RepeatAll); break;
     case kCmdIgnoreApp: ChangeSettings([&](Settings& s) { s.ignoredApps.push_back(name); }); break;
+    case kCmdPinApp: ChangeSettings([&](Settings& s) { s.pinnedApp = shownIsPinned ? L"" : name; }); break;
+    case kCmdUnpin: ChangeSettings([](Settings& s) { s.pinnedApp.clear(); }); break;
     case kCmdPreferMusic: ChangeSettings([](Settings& s) { s.preferMusicApps = !s.preferMusicApps; }); break;
     case kCmdPreferNonBrowsers: ChangeSettings([](Settings& s) { s.preferNonBrowsers = !s.preferNonBrowsers; }); break;
     case kCmdStayVisible: ChangeSettings([](Settings& s) { s.stayVisibleWhenPaused = !s.stayVisibleWhenPaused; }); break;

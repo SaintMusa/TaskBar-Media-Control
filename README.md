@@ -18,6 +18,7 @@ browsers (YouTube, Twitch) and media players.
 - Switch between apps that are playing with the **›** button or the mouse wheel
 - Ctrl + scroll changes the playing app's own volume
 - Music apps take priority over browsers and video players (can be turned off)
+- Pin an app to keep it on the widget while others play; switching away still works
 - Hide apps you never want to see, or make browsers show only when nothing else plays
 - Hides itself when nothing is playing, or after a while paused (or stays, if you prefer)
 - Right-click menu with shuffle, repeat, switching and all options
@@ -66,6 +67,7 @@ soon as you save the file.
 | `StayVisibleWhenPaused` | Keep showing the last track while paused |
 | `HideAfterPausedSeconds` | Otherwise, hide after this many seconds paused |
 | `Ignore` | Apps never to show, separated by `;` (name, exe or app ID) |
+| `Pinned` | An app to show whenever it's open; a switch away lasts until that app pauses |
 | `PreferMusicApps` / `MusicApps` | Show a playing music app over anything else |
 | `PreferNonBrowsers` / `Browsers` | Show a browser only while no other app plays |
 
