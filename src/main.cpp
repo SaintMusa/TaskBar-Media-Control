@@ -85,6 +85,7 @@ constexpr int kCornerRadius = 6;
 constexpr int kInnerPadding = 4;       // box edge to art and buttons
 constexpr int kGap = 8;                // art to text, text to buttons
 constexpr int kButtonWidth = 28;
+constexpr int kSwitchButtonWidth = 16; // the small "more apps" chevron
 constexpr int kArtRadius = 4;
 constexpr int kSeekbarThickness = 3;
 constexpr UINT kMarqueePauseMs = 2000; // long text rests this long at each end
@@ -94,6 +95,7 @@ constexpr int kMarqueeFade = 12;       // DIPs of fade where text runs past the 
 constexpr float kTitleFontSize = 12.0f;
 constexpr float kArtistFontSize = 11.0f;
 constexpr float kIconFontSize = 14.0f;
+constexpr float kSwitchIconFontSize = 10.0f;
 
 // Segoe Fluent Icons code points.
 constexpr wchar_t kGlyphPrevious = 0xE892;
@@ -156,6 +158,7 @@ struct State {
     ComPtr<IDWriteTextFormat> titleFormat;
     ComPtr<IDWriteTextFormat> artistFormat;
     ComPtr<IDWriteTextFormat> iconFormat;
+    ComPtr<IDWriteTextFormat> smallIconFormat; // the switch chevron
     UINT textFormatDpi = 0;
     ComPtr<ID2D1Bitmap> artBitmap;           // nowPlaying.art, uploaded for drawing
     const MediaArt* artBitmapSource = nullptr;
@@ -311,6 +314,19 @@ ComPtr<IDWriteTextFormat> CreateLineFormat(DWRITE_FONT_WEIGHT weight, float size
     return format;
 }
 
+// Segoe Fluent Icons glyphs, centered in their box.
+ComPtr<IDWriteTextFormat> CreateIconFormat(float sizeDip) {
+    ComPtr<IDWriteTextFormat> format;
+    if (FAILED(g.dwrite->CreateTextFormat(L"Segoe Fluent Icons", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+                                          DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                                          sizeDip * g.dpi / 96.0f, L"", &format))) {
+        return nullptr;
+    }
+    format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    return format;
+}
+
 bool EnsureGraphics() {
     if (!g.d2d && FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, g.d2d.GetAddressOf()))) return false;
     if (!g.dwrite && FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
@@ -326,17 +342,12 @@ bool EnsureGraphics() {
         // ClearType needs an opaque background; grayscale works on transparent pixels.
         g.target->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
     }
-    if (!g.titleFormat || !g.artistFormat || !g.iconFormat || g.textFormatDpi != g.dpi) {
+    if (!g.titleFormat || !g.artistFormat || !g.iconFormat || !g.smallIconFormat || g.textFormatDpi != g.dpi) {
         g.titleFormat = CreateLineFormat(DWRITE_FONT_WEIGHT_SEMI_BOLD, kTitleFontSize);
         g.artistFormat = CreateLineFormat(DWRITE_FONT_WEIGHT_NORMAL, kArtistFontSize);
-        g.iconFormat.Reset();
-        if (SUCCEEDED(g.dwrite->CreateTextFormat(L"Segoe Fluent Icons", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
-                                                 DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
-                                                 kIconFontSize * g.dpi / 96.0f, L"", &g.iconFormat))) {
-            g.iconFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-            g.iconFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-        }
-        if (!g.titleFormat || !g.artistFormat || !g.iconFormat) return false;
+        g.iconFormat = CreateIconFormat(kIconFontSize);
+        g.smallIconFormat = CreateIconFormat(kSwitchIconFontSize);
+        if (!g.titleFormat || !g.artistFormat || !g.iconFormat || !g.smallIconFormat) return false;
         g.textFormatDpi = g.dpi;
     }
     return true;
@@ -347,14 +358,19 @@ bool EnsureGraphics() {
 WidgetLayout ComputeLayout(float w, float h) {
     const float pad = static_cast<float>(Scale(kInnerPadding));
     const float gap = static_cast<float>(Scale(kGap));
-    const float buttonW = static_cast<float>(Scale(kButtonWidth));
-    const int shown = g.nowPlaying.sessionCount > 1 ? kButtonCount : kButtonSwitchApp;
+    const bool hasSwitch = g.nowPlaying.sessionCount > 1;
+    const int shown = hasSwitch ? kButtonCount : kButtonSwitchApp;
+    auto widthOf = [](int button) {
+        return static_cast<float>(Scale(button == kButtonSwitchApp ? kSwitchButtonWidth : kButtonWidth));
+    };
+    float total = 0;
+    for (int i = 0; i < shown; ++i) total += widthOf(i);
     WidgetLayout layout{};
     layout.art = D2D1::RectF(pad, pad, pad + (h - 2 * pad), h - pad);
-    float x = w - pad - buttonW * static_cast<float>(shown);
+    float x = w - pad - total;
     for (int i = 0; i < shown; ++i) {
-        layout.buttons[i] = D2D1::RectF(x, pad, x + buttonW, h - pad);
-        x += buttonW;
+        layout.buttons[i] = D2D1::RectF(x, pad, x + widthOf(i), h - pad);
+        x += widthOf(i);
     }
     layout.text = D2D1::RectF(layout.art.right + gap, 0, layout.buttons[0].left - gap / 2, h);
     // Full width along the bottom edge; DrawSeekbar clips it to the rounded corners.
@@ -503,7 +519,8 @@ void DrawStatic(const WidgetLayout& layout, float w, float h) {
                                            paint.Get());
         }
         paint->SetColor(InkAt(!enabled ? 0.3f : isPressed ? 0.7f : 0.92f));
-        g.target->DrawTextW(&glyphs[i], 1, g.iconFormat.Get(), layout.buttons[i], paint.Get());
+        IDWriteTextFormat* format = i == kButtonSwitchApp ? g.smallIconFormat.Get() : g.iconFormat.Get();
+        g.target->DrawTextW(&glyphs[i], 1, format, layout.buttons[i], paint.Get());
     }
 }
 
@@ -1630,6 +1647,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     g.watcher.Stop();
     g.titleFormat.Reset();
     g.artistFormat.Reset();
+    g.iconFormat.Reset();
+    g.smallIconFormat.Reset();
     g.target.Reset();
     g.dwrite.Reset();
     g.d2d.Reset();
