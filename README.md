@@ -11,7 +11,9 @@ browsers (YouTube, Twitch) and media players.
 
 ## Features
 
-- Cover art with the playing app's icon on its corner; click it to open the app
+- Cover art with the playing app's icon on its corner
+- Click the widget for a pop-up player with big art, a draggable seekbar,
+  shuffle and repeat, and every app with media to switch between
 - Title and artist, dimmed while paused; long text scrolls back and forth
 - Previous / play-pause / next buttons, greyed out when the app does not allow them
 - Seekbar along the bottom edge in the cover art's color, hidden for live streams
@@ -50,7 +52,11 @@ to install.
 ## Use
 
 - Run `TaskbarMedia.exe`. The widget appears on the left side of the taskbar.
-- Click the buttons to control playback, or the cover art to open the app.
+- Click the buttons to control playback.
+- Click anywhere else on the widget to open the pop-up player. Click its art or
+  app name to open the app; Esc or a click elsewhere closes it. While it's open:
+  Space plays or pauses, the arrow keys skip (Shift + arrows seek), up and down
+  pick an app and Enter switches to it.
 - Scroll over the widget, or click **›**, to switch to another app that has media.
   One scroll gesture switches one app.
 - Ctrl + scroll to change that app's volume, Shift + scroll to seek.
@@ -84,6 +90,7 @@ is injected into Explorer and no system files are changed.
 | File | What it does |
 |---|---|
 | `src/main.cpp` | The widget window, layout, drawing (Direct2D in software mode), menu and tooltip. A hidden window listens for Windows broadcasts such as Explorer restarts and theme changes. |
+| `src/popup.*` | The pop-up player: its own window with Windows 11 acrylic, created on open and destroyed on close. |
 | `src/taskbar_watcher.*` | Finds the Start and Widgets buttons with UI Automation, on its own thread, to know where the free space is. |
 | `src/media_watcher.*` | Follows the Windows media sessions (`GlobalSystemMediaTransportControls`) on one worker thread, picks which one to show, and decodes cover art and app icons. |
 | `src/app_info.*` | The app behind a session: its name, exe and windows (to open it). |
