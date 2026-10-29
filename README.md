@@ -14,7 +14,9 @@ browsers (YouTube, Twitch) and media players.
 - Cover art with the playing app's icon on its corner; click it to open the app
 - Title and artist, dimmed while paused; long text scrolls back and forth
 - Previous / play-pause / next buttons, greyed out when the app does not allow them
-- Seekbar along the bottom edge (display only), hidden for live streams
+- Seekbar along the bottom edge in the cover art's color, hidden for live streams
+- Shift + scroll to seek 5 seconds at a time
+- Cross-fade when the track changes
 - Switch between apps that are playing with the **›** button or the mouse wheel
 - Ctrl + scroll changes the playing app's own volume
 - Music apps take priority over browsers and video players (can be turned off)
@@ -51,7 +53,7 @@ to install.
 - Click the buttons to control playback, or the cover art to open the app.
 - Scroll over the widget, or click **›**, to switch to another app that has media.
   One scroll gesture switches one app.
-- Ctrl + scroll to change that app's volume.
+- Ctrl + scroll to change that app's volume, Shift + scroll to seek.
 - Rest the mouse on the widget to see the full title.
 - Right-click for shuffle, repeat, switching, hiding apps, **Start with
   Windows** and **Exit TaskbarMedia**.
@@ -67,10 +69,12 @@ setting has a comment, and changes apply as soon as you save the file.
 |---|---|
 | `StayVisibleWhenPaused` | Keep showing the last track while paused |
 | `HideAfterPausedSeconds` | Otherwise, hide after this many seconds paused |
+| `ArtColorSeekbar` | Color the seekbar with the cover art's main color |
 | `Ignore` | Apps never to show, separated by `;` (name, exe or app ID) |
 | `Pinned` | An app to show whenever it's open; switching away lasts until you switch back or the pinned app plays |
 | `PreferMusicApps` / `MusicApps` | Show a playing music app over anything else |
 | `PreferNonBrowsers` / `Browsers` | Show a browser only while no other app plays |
+| `[Hotkeys]` | Optional keys that work from any app, e.g. `PlayPause=Ctrl+Alt+Up` (off by default) |
 
 ## How it works
 
