@@ -577,7 +577,25 @@ void MediaWatcher::Run() {
                 info.canRepeat = best->canRepeat;
                 info.canSeek = best->canSeek;
                 info.repeat = best->repeat;
-                for (const auto& t : tracked) info.sessions.push_back({t.appId, t.appName, t.title, t.wasPlaying});
+                // While the pop-up is open it lists every app, so fill in the ones
+                // never shown yet (once each; later changes mark them stale again).
+                if (largeSize) {
+                    for (auto& t : tracked) {
+                        if (&t == best || !t.propertiesStale->exchange(false)) continue;
+                        try {
+                            if (auto props = t.session.TryGetMediaPropertiesAsync().get()) {
+                                t.title = props.Title();
+                                t.artist = props.Artist();
+                                t.art = DecodeThumbnail(wic.Get(), props.Thumbnail(), artSize_);
+                                t.hasAccent = t.art && FindAccent(*t.art, t.accentHue, t.accentSaturation);
+                            }
+                        } catch (...) {
+                        }
+                    }
+                }
+                for (const auto& t : tracked) {
+                    info.sessions.push_back({t.appId, t.appName, t.title, t.artist, t.art, t.wasPlaying});
+                }
                 ReadTimeline(best->session, info);
                 shownAppId = best->appId;
                 shown = best->session;

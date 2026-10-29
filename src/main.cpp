@@ -1160,6 +1160,7 @@ void TogglePopup() {
     host.send = [](MediaCommand command) { g.media.Send(command); };
     host.seek = [](int64_t positionMs) { SeekToMs(positionMs); };
     host.openApp = [] { ActivateApp(g.nowPlaying.appId); };
+    host.pick = [](const std::wstring& appId) { g.media.ShowSession(appId); };
     host.closed = [] { g.media.SetLargeArtSize(0); }; // the big cover isn't kept around
     g.media.SetLargeArtSize(PopupArtSize(g.dpi));
     OpenPopup(g.instance, g.controller, placement, std::move(host));

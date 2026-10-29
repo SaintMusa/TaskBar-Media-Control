@@ -22,6 +22,7 @@ struct PopupHost {
     std::function<void(MediaCommand)> send;
     std::function<void(int64_t positionMs)> seek; // from the start of the track
     std::function<void()> openApp;
+    std::function<void(const std::wstring& appId)> pick; // show this app instead
     std::function<void()> closed;             // the pop-up has just closed
 };
 

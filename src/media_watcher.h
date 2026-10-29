@@ -19,7 +19,9 @@ struct MediaArt {
 struct SessionSummary {
     std::wstring appId;
     std::wstring appName;
-    std::wstring title; // empty until that session has been shown once
+    std::wstring title;  // empty until known: shown once, or listed while the pop-up is open
+    std::wstring artist;
+    std::shared_ptr<const MediaArt> art;
     bool playing = false;
 
     bool operator==(const SessionSummary&) const = default;
@@ -114,7 +116,8 @@ public:
     void SetFilter(AppFilter filter);
     // Pixel size to decode cover art at; applies from the next track.
     void SetArtSize(UINT pixels) { artSize_ = pixels; }
-    // Also decode the cover at this size (for the pop-up); 0 drops it again.
+    // Also decode the cover at this size (for the pop-up), and fetch title and
+    // art for every listed app; 0 drops the big cover again.
     void SetLargeArtSize(UINT pixels);
 
     // How many times the worker woke up, and how many of those were the cheap

@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cwchar>
 #include <string>
+#include <vector>
 
 using Microsoft::WRL::ComPtr;
 
@@ -24,7 +25,9 @@ constexpr int kArtistTop = 256, kArtistHeight = 18;
 constexpr int kSeekCenter = 290, kSeekHitHeight = 20, kSeekThickness = 4, kSeekHoverThickness = 6, kThumb = 12;
 constexpr int kTimesTop = 297, kTimesHeight = 14;
 constexpr int kControlsTop = 316, kButton = 40, kPlayButton = 48, kButtonGap = 6, kButtonRadius = 6;
-constexpr int kHeight = 372;
+constexpr int kNowPlayingBottom = 372;
+// The app list, only when two or more apps have media.
+constexpr int kRowHeight = 48, kRowInset = 8, kRowArt = 32, kRowRadius = 6, kMaxRows = 5, kListPad = 8;
 constexpr int kGapAboveTaskbar = 12; // like Windows' own flyouts
 
 constexpr int64_t kWheelSeekMs = 5000;
@@ -48,7 +51,7 @@ constexpr int kCornerRound = 2;              // DWMWCP_ROUND
 constexpr int kBackdropTransientWindow = 3;  // DWMSBT_TRANSIENTWINDOW: acrylic, as in flyouts
 
 // Everything the mouse can point at.
-enum class Hit { None, Header, Art, Seek, Shuffle, Previous, PlayPause, Next, Repeat };
+enum class Hit { None, Header, Art, Seek, Shuffle, Previous, PlayPause, Next, Repeat, Row };
 constexpr Hit kControls[] = {Hit::Shuffle, Hit::Previous, Hit::PlayPause, Hit::Next, Hit::Repeat};
 
 struct PopupState {
@@ -60,6 +63,8 @@ struct PopupState {
 
     Hit hovered = Hit::None;
     Hit pressed = Hit::None;
+    int hoveredRow = -1, pressedRow = -1; // with Hit::Row
+    int bottom = 0; // screen y the pop-up's bottom edge stays at as it grows or shrinks
     bool trackingMouse = false;
     bool dragging = false;     // the seekbar thumb is held
     double dragFraction = 0;   // where it's held, 0..1
@@ -70,6 +75,8 @@ struct PopupState {
     ComPtr<IDWriteTextFormat> titleFormat, artistFormat, headerFormat, timeLeftFormat, timeRightFormat;
     ComPtr<IDWriteTextFormat> iconFormat, playIconFormat, placeholderFormat;
     ComPtr<ID2D1Bitmap> largeArt, smallArt, icon;
+    std::vector<std::pair<const MediaArt*, ComPtr<ID2D1Bitmap>>> rowArt; // the list's covers
+    ComPtr<IDWriteTextFormat> rowTitleFormat, rowDetailFormat, rowIconFormat;
     const MediaArt *largeArtSource = nullptr, *smallArtSource = nullptr, *iconSource = nullptr;
     HDC memDC = nullptr;
     HBITMAP bitmap = nullptr;
@@ -152,6 +159,20 @@ bool ControlEnabled(Hit control, const MediaInfo& m) {
 
 bool CanSeek(const MediaInfo& m) { return m.hasTimeline && m.canSeek && m.durationMs > 0; }
 
+int RowCount(const MediaInfo& m) {
+    return m.sessions.size() < 2 ? 0 : std::min<int>(static_cast<int>(m.sessions.size()), kMaxRows);
+}
+
+int ContentHeight(const MediaInfo& m) {
+    const int rows = RowCount(m);
+    return kNowPlayingBottom + (rows ? 1 + kListPad * 2 + rows * kRowHeight : 0);
+}
+
+D2D1_RECT_F RowRect(int index) {
+    const float top = S(kNowPlayingBottom) + S(1) + S(kListPad) + S(kRowHeight) * index;
+    return D2D1::RectF(S(kRowInset), top, S(kWidth) - S(kRowInset), top + S(kRowHeight));
+}
+
 Hit HitTest(POINT pt) {
     const MediaInfo& m = p.host.media();
     if (Contains(HeaderRect(), pt)) return Hit::Header;
@@ -161,6 +182,15 @@ Hit HitTest(POINT pt) {
         if (Contains(ControlRect(c), pt)) return c;
     }
     return Hit::None;
+}
+
+// Which row of the app list is under the point, or -1.
+int RowAt(POINT pt) {
+    const int rows = RowCount(p.host.media());
+    for (int i = 0; i < rows; ++i) {
+        if (Contains(RowRect(i), pt)) return i;
+    }
+    return -1;
 }
 
 double FractionAt(int x) {
@@ -203,7 +233,11 @@ void FreeGraphics() {
     p.largeArt.Reset();
     p.smallArt.Reset();
     p.icon.Reset();
+    p.rowArt.clear();
     p.largeArtSource = p.smallArtSource = p.iconSource = nullptr;
+    p.rowTitleFormat.Reset();
+    p.rowDetailFormat.Reset();
+    p.rowIconFormat.Reset();
     p.titleFormat.Reset();
     p.artistFormat.Reset();
     p.headerFormat.Reset();
@@ -240,6 +274,9 @@ bool EnsureGraphics(SIZE size) {
         p.iconFormat = MakeFormat(icons, DWRITE_FONT_WEIGHT_NORMAL, 16, DWRITE_TEXT_ALIGNMENT_CENTER, false);
         p.playIconFormat = MakeFormat(icons, DWRITE_FONT_WEIGHT_NORMAL, 22, DWRITE_TEXT_ALIGNMENT_CENTER, false);
         p.placeholderFormat = MakeFormat(icons, DWRITE_FONT_WEIGHT_NORMAL, 48, DWRITE_TEXT_ALIGNMENT_CENTER, false);
+        p.rowTitleFormat = MakeFormat(text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 13, DWRITE_TEXT_ALIGNMENT_LEADING, true);
+        p.rowDetailFormat = MakeFormat(text, DWRITE_FONT_WEIGHT_NORMAL, 12, DWRITE_TEXT_ALIGNMENT_LEADING, true);
+        p.rowIconFormat = MakeFormat(icons, DWRITE_FONT_WEIGHT_NORMAL, 12, DWRITE_TEXT_ALIGNMENT_CENTER, false);
     }
     if (!p.bitmap || p.bitmapSize.cx != size.cx || p.bitmapSize.cy != size.cy) {
         if (p.memDC) {
@@ -257,7 +294,8 @@ bool EnsureGraphics(SIZE size) {
         p.bitmapSize = size;
     }
     return p.titleFormat && p.artistFormat && p.headerFormat && p.timeLeftFormat && p.timeRightFormat &&
-           p.iconFormat && p.playIconFormat && p.placeholderFormat;
+           p.iconFormat && p.playIconFormat && p.placeholderFormat && p.rowTitleFormat && p.rowDetailFormat &&
+           p.rowIconFormat;
 }
 
 // Uploads an image to a Direct2D bitmap once, when it changes.
@@ -399,6 +437,93 @@ void DrawNowPlaying(const MediaInfo& m, ID2D1SolidColorBrush* paint) {
     }
 }
 
+// A cover for the list, uploaded once per image and reused while it stays.
+ID2D1Bitmap* RowArt(const MediaArt* image) {
+    if (!image) return nullptr;
+    for (auto& [source, bitmap] : p.rowArt) {
+        if (source == image) return bitmap.Get();
+    }
+    ComPtr<ID2D1Bitmap> bitmap;
+    const MediaArt* uploadedFrom = nullptr;
+    Uploaded(image, bitmap, uploadedFrom);
+    p.rowArt.emplace_back(image, bitmap);
+    return bitmap.Get();
+}
+
+// Every app with media: the one on screen is highlighted with a bar in the
+// cover's color, like Windows' own media flyout; playing ones get a small play mark.
+void DrawAppList(const MediaInfo& m, ID2D1SolidColorBrush* paint) {
+    const int rows = RowCount(m);
+    if (!rows) return;
+    // Forget covers no longer listed, so they don't pile up while open.
+    std::erase_if(p.rowArt, [&](const auto& entry) {
+        return std::none_of(m.sessions.begin(), m.sessions.end(),
+                            [&](const SessionSummary& s) { return s.art.get() == entry.first; });
+    });
+
+    paint->SetColor(Ink(0.08f));
+    p.target->FillRectangle(D2D1::RectF(0, S(kNowPlayingBottom), S(kWidth), S(kNowPlayingBottom) + S(1)), paint);
+    for (int i = 0; i < rows; ++i) {
+        const SessionSummary& s = m.sessions[i];
+        const auto row = RowRect(i);
+        const bool current = s.appId == m.appId;
+        if (current || p.hoveredRow == i) {
+            paint->SetColor(Ink(current ? 0.08f : (p.pressedRow == i ? 0.04f : 0.05f)));
+            p.target->FillRoundedRectangle(D2D1::RoundedRect(row, S(kRowRadius), S(kRowRadius)), paint);
+        }
+        if (current) {
+            const float mid = (row.top + row.bottom) / 2;
+            paint->SetColor(p.host.accent());
+            p.target->FillRoundedRectangle(
+                D2D1::RoundedRect(D2D1::RectF(row.left, mid - S(9), row.left + S(3), mid + S(9)), S(1.5f), S(1.5f)),
+                paint);
+        }
+
+        const float artLeft = row.left + S(8), artTop = row.top + (row.bottom - row.top - S(kRowArt)) / 2;
+        const auto art = D2D1::RectF(artLeft, artTop, artLeft + S(kRowArt), artTop + S(kRowArt));
+        if (ID2D1Bitmap* cover = RowArt(s.art.get())) {
+            FillWithImage(cover, art, S(4));
+        } else {
+            paint->SetColor(Ink(0.08f));
+            p.target->FillRoundedRectangle(D2D1::RoundedRect(art, S(4), S(4)), paint);
+            paint->SetColor(Ink(0.4f));
+            p.target->DrawTextW(&kGlyphMusic, 1, p.rowIconFormat.Get(), art, paint);
+        }
+
+        const float textLeft = art.right + S(10), textRight = row.right - S(28);
+        const std::wstring name = s.appName.empty() ? s.appId : s.appName;
+        const std::wstring title = s.title.empty() ? name : s.title;
+        std::wstring detail = s.artist;
+        if (!s.title.empty()) detail += (detail.empty() ? L"" : L" \u00B7 ") + name;
+        const float mid = (row.top + row.bottom) / 2;
+        paint->SetColor(Ink(0.95f));
+        DrawText(title, p.rowTitleFormat.Get(),
+                 D2D1::RectF(textLeft, detail.empty() ? row.top : mid - S(18), textRight,
+                             detail.empty() ? row.bottom : mid + S(1)),
+                 paint);
+        if (!detail.empty()) {
+            paint->SetColor(Ink(0.6f));
+            DrawText(detail, p.rowDetailFormat.Get(), D2D1::RectF(textLeft, mid, textRight, mid + S(17)), paint);
+        }
+        if (s.playing) {
+            paint->SetColor(Ink(0.6f));
+            p.target->DrawTextW(&kGlyphPlay, 1, p.rowIconFormat.Get(),
+                                D2D1::RectF(row.right - S(28), row.top, row.right - S(4), row.bottom), paint);
+        }
+    }
+}
+
+// Keeps the window as tall as its content, growing upward from a fixed bottom.
+void FitHeight() {
+    if (!p.hwnd) return;
+    RECT window;
+    GetWindowRect(p.hwnd, &window);
+    const int height = Scale(ContentHeight(p.host.media()));
+    if (window.bottom - window.top == height) return;
+    SetWindowPos(p.hwnd, nullptr, window.left, p.bottom - height, window.right - window.left, height,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
 // Draws into a premultiplied 32-bit bitmap and copies it to the window. With
 // the frame extended over the whole window, DWM treats transparent pixels as
 // "show the acrylic backdrop here", so the content floats on the blur.
@@ -414,12 +539,16 @@ void Paint(HDC windowDC) {
     p.target->CreateSolidColorBrush(Ink(1.0f), &paint);
     p.target->BeginDraw();
     p.target->Clear(D2D1::ColorF(0, 0, 0, 0));
-    if (paint) DrawNowPlaying(p.host.media(), paint.Get());
+    if (paint) {
+        DrawNowPlaying(p.host.media(), paint.Get());
+        DrawAppList(p.host.media(), paint.Get());
+    }
     if (p.target->EndDraw() == D2DERR_RECREATE_TARGET) {
         p.target.Reset();
         p.largeArt.Reset();
         p.smallArt.Reset();
         p.icon.Reset();
+        p.rowArt.clear();
         p.largeArtSource = p.smallArtSource = p.iconSource = nullptr;
     }
     BitBlt(windowDC, 0, 0, size.cx, size.cy, p.memDC, 0, 0, SRCCOPY);
@@ -465,7 +594,8 @@ void Activate(Hit hit) {
 bool Clickable(Hit hit, const MediaInfo& m) {
     switch (hit) {
     case Hit::Header:
-    case Hit::Art: return true;
+    case Hit::Art:
+    case Hit::Row: return true;
     case Hit::Seek: return CanSeek(m);
     case Hit::None: return false;
     default: return ControlEnabled(hit, m);
@@ -493,7 +623,7 @@ LRESULT CALLBACK PopupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             POINT pt;
             GetCursorPos(&pt);
             ScreenToClient(hwnd, &pt);
-            const bool hand = Clickable(HitTest(pt), p.host.media()) || p.dragging;
+            const bool hand = Clickable(RowAt(pt) >= 0 ? Hit::Row : HitTest(pt), p.host.media()) || p.dragging;
             SetCursor(LoadCursorW(nullptr, hand ? IDC_HAND : IDC_ARROW));
             return TRUE;
         }
@@ -509,9 +639,11 @@ LRESULT CALLBACK PopupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             Redraw();
             return 0;
         }
-        const Hit hit = HitTest(pt);
-        if (hit != p.hovered) {
+        const int row = RowAt(pt);
+        const Hit hit = row >= 0 ? Hit::Row : HitTest(pt);
+        if (hit != p.hovered || row != p.hoveredRow) {
             p.hovered = hit;
+            p.hoveredRow = row;
             Redraw(); // only when what's under the mouse changes
         }
         return 0;
@@ -520,15 +652,18 @@ LRESULT CALLBACK PopupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         p.trackingMouse = false;
         if (p.hovered != Hit::None && !p.dragging) {
             p.hovered = Hit::None;
+            p.hoveredRow = -1;
             Redraw();
         }
         return 0;
     case WM_LBUTTONDOWN: {
         const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-        const Hit hit = HitTest(pt);
+        const int row = RowAt(pt);
+        const Hit hit = row >= 0 ? Hit::Row : HitTest(pt);
         const MediaInfo& m = p.host.media();
         if (!Clickable(hit, m)) return 0;
         SetCapture(hwnd);
+        p.pressedRow = row;
         if (hit == Hit::Seek) {
             p.dragging = true;
             p.dragFraction = FractionAt(pt.x);
@@ -541,15 +676,26 @@ LRESULT CALLBACK PopupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_LBUTTONUP: {
         const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        // Take the press state first: releasing capture sends WM_CAPTURECHANGED
+        // right away, which clears it.
+        const bool wasDragging = p.dragging;
+        const Hit pressed = p.pressed;
+        const int pressedRow = p.pressedRow;
+        p.dragging = false;
+        p.pressed = Hit::None;
+        p.pressedRow = -1;
         if (GetCapture() == hwnd) ReleaseCapture();
         const MediaInfo& m = p.host.media();
-        if (p.dragging) {
-            p.dragging = false;
+        if (wasDragging) {
             p.host.seek(static_cast<int64_t>(FractionAt(pt.x) * m.durationMs));
-        } else if (p.pressed != Hit::None && HitTest(pt) == p.pressed) {
-            Activate(p.pressed);
+        } else if (pressed == Hit::Row) {
+            const int row = RowAt(pt);
+            if (row >= 0 && row == pressedRow && row < static_cast<int>(m.sessions.size())) {
+                p.host.pick(m.sessions[row].appId); // the pop-up stays open on the new app
+            }
+        } else if (pressed != Hit::None && HitTest(pt) == pressed) {
+            Activate(pressed);
         }
-        p.pressed = Hit::None;
         if (p.hwnd) {
             Redraw();
             ScheduleProgress();
@@ -596,6 +742,7 @@ LRESULT CALLBACK PopupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             p.hwnd = nullptr;
             p.closedAt = GetTickCount64();
             p.hovered = p.pressed = Hit::None;
+            p.hoveredRow = p.pressedRow = -1;
             p.dragging = p.trackingMouse = false;
             FreeGraphics(); // everything the pop-up used goes with it
             if (p.host.closed) p.host.closed();
@@ -622,7 +769,7 @@ void OpenPopup(HINSTANCE instance, HWND owner, const PopupPlacement& placement, 
     p.host = std::move(host);
     p.dpi = placement.dpi;
     p.lightTheme = placement.lightTheme;
-    const int width = Scale(kWidth), height = Scale(kHeight);
+    const int width = Scale(kWidth), height = Scale(ContentHeight(p.host.media()));
 
     // Above the taskbar, lined up with the widget's left edge, kept on screen.
     MONITORINFO monitor{sizeof(monitor)};
@@ -630,7 +777,8 @@ void OpenPopup(HINSTANCE instance, HWND owner, const PopupPlacement& placement, 
     const RECT& area = monitor.rcWork;
     const int x = std::clamp<int>(placement.anchor.left, area.left + Scale(kGapAboveTaskbar),
                                   area.right - width - Scale(kGapAboveTaskbar));
-    const int y = std::max<int>(area.top, placement.taskbar.top - height - Scale(kGapAboveTaskbar));
+    p.bottom = placement.taskbar.top - Scale(kGapAboveTaskbar);
+    const int y = std::max<int>(area.top, p.bottom - height);
 
     // WS_THICKFRAME: system backdrops (acrylic) are drawn in a window's frame,
     // and a bare WS_POPUP has none. WM_NCCALCSIZE then hides that frame.
@@ -659,6 +807,7 @@ bool PopupIsOpen() { return p.hwnd != nullptr; }
 
 void PopupRefresh() {
     if (!p.hwnd || p.dragging) return; // a drag in progress keeps its own position
+    FitHeight(); // apps can come and go while it's open
     Redraw();
     ScheduleProgress();
 }
