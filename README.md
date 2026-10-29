@@ -67,7 +67,7 @@ soon as you save the file.
 | `StayVisibleWhenPaused` | Keep showing the last track while paused |
 | `HideAfterPausedSeconds` | Otherwise, hide after this many seconds paused |
 | `Ignore` | Apps never to show, separated by `;` (name, exe or app ID) |
-| `Pinned` | An app to show whenever it's open; a switch away lasts until that app pauses |
+| `Pinned` | An app to show whenever it's open; switching away lasts until you switch back or the pinned app plays |
 | `PreferMusicApps` / `MusicApps` | Show a playing music app over anything else |
 | `PreferNonBrowsers` / `Browsers` | Show a browser only while no other app plays |
 

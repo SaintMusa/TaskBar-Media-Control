@@ -15,7 +15,8 @@ struct Settings {
     // name ("Spotify"), exe ("msedge.exe") or AppUserModelID.
     std::vector<std::wstring> ignoredApps;
     // The app to show whenever it's open, over every other rule. Swapping to
-    // another app still works but lasts only until that app pauses.
+    // another app still works and lasts until you swap back, that app closes,
+    // or the pinned app starts playing.
     std::wstring pinnedApp;
     // While a music app is playing it wins over every other app.
     bool preferMusicApps = true;

@@ -26,7 +26,7 @@ constexpr wchar_t kTemplate[] =
     L"; menu (Spotify), an exe name (msedge.exe) or an app ID.\r\n"
     L"Ignore=\r\n"
     L"; An app to keep on the widget whenever it's open, even while others play.\r\n"
-    L"; Switching away still works, until the app you switched to pauses.\r\n"
+    L"; Switching away lasts until you switch back or the pinned app plays.\r\n"
     L"Pinned=\r\n"
     L"; 1 = while a music app is playing, show it over any other app.\r\n"
     L"PreferMusicApps=1\r\n"
