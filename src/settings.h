@@ -28,6 +28,12 @@ struct Settings {
     // What counts as a browser: matched against the app's name or ID.
     std::vector<std::wstring> browsers;
 
+    // Keys that work from any app, like "Ctrl+Alt+Up". Empty = off (the default).
+    std::wstring hotkeyPlayPause;
+    std::wstring hotkeyNext;
+    std::wstring hotkeyPrevious;
+    std::wstring hotkeySwitchApp;
+
     bool operator==(const Settings&) const = default;
 };
 

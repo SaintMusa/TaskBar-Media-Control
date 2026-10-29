@@ -35,7 +35,16 @@ constexpr wchar_t kTemplate[] =
     L"; 1 = show a browser only while no other app is playing.\r\n"
     L"PreferNonBrowsers=0\r\n"
     L"; What counts as a browser, separated by ;\r\n"
-    L"Browsers=Helium;Chrome;Edge;Firefox;Brave;Opera;Vivaldi;Zen;Arc\r\n";
+    L"Browsers=Helium;Chrome;Edge;Firefox;Brave;Opera;Vivaldi;Zen;Arc\r\n"
+    L"\r\n"
+    L"[Hotkeys]\r\n"
+    L"; Off unless filled in. They work from any app: Ctrl, Alt, Shift and Win plus\r\n"
+    L"; one key, joined with + (Space, Left, Right, Up, Down, A-Z, 0-9, F1-F24).\r\n"
+    L"; For example: PlayPause=Ctrl+Alt+Up  Next=Ctrl+Alt+Right  Previous=Ctrl+Alt+Left\r\n"
+    L"PlayPause=\r\n"
+    L"Next=\r\n"
+    L"Previous=\r\n"
+    L"SwitchApp=\r\n";
 
 std::wstring ReadString(const wchar_t* section, const wchar_t* key, const wchar_t* fallback) {
     wchar_t buffer[2048];
@@ -127,6 +136,11 @@ Settings LoadSettings() {
     s.musicApps = SplitList(ReadString(L"Apps", L"MusicApps", kDefaultMusicApps));
     s.preferNonBrowsers = GetPrivateProfileIntW(L"Apps", L"PreferNonBrowsers", 0, path.c_str()) != 0;
     s.browsers = SplitList(ReadString(L"Apps", L"Browsers", kDefaultBrowsers));
+    const Settings defaults;
+    s.hotkeyPlayPause = ReadString(L"Hotkeys", L"PlayPause", defaults.hotkeyPlayPause.c_str());
+    s.hotkeyNext = ReadString(L"Hotkeys", L"Next", defaults.hotkeyNext.c_str());
+    s.hotkeyPrevious = ReadString(L"Hotkeys", L"Previous", defaults.hotkeyPrevious.c_str());
+    s.hotkeySwitchApp = ReadString(L"Hotkeys", L"SwitchApp", defaults.hotkeySwitchApp.c_str());
     return s;
 }
 
@@ -143,6 +157,10 @@ void SaveSettings(const Settings& s) {
     WritePrivateProfileStringW(L"Apps", L"MusicApps", JoinList(s.musicApps).c_str(), path.c_str());
     WritePrivateProfileStringW(L"Apps", L"PreferNonBrowsers", s.preferNonBrowsers ? L"1" : L"0", path.c_str());
     WritePrivateProfileStringW(L"Apps", L"Browsers", JoinList(s.browsers).c_str(), path.c_str());
+    WritePrivateProfileStringW(L"Hotkeys", L"PlayPause", s.hotkeyPlayPause.c_str(), path.c_str());
+    WritePrivateProfileStringW(L"Hotkeys", L"Next", s.hotkeyNext.c_str(), path.c_str());
+    WritePrivateProfileStringW(L"Hotkeys", L"Previous", s.hotkeyPrevious.c_str(), path.c_str());
+    WritePrivateProfileStringW(L"Hotkeys", L"SwitchApp", s.hotkeySwitchApp.c_str(), path.c_str());
 }
 
 bool StartsWithWindows() {

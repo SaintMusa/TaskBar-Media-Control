@@ -929,6 +929,77 @@ void OnMediaChanged() {
     Render(sameTimeline == previous ? Redraw::Seekbar : Redraw::Full);
 }
 
+// ---------------------------------------------------------------------------
+// Global hotkeys, registered with Windows (no keyboard hook), so they cost
+// nothing until pressed and work whichever app is in front.
+
+enum : int { kHotkeyPlayPause = 1, kHotkeyNext, kHotkeyPrevious, kHotkeySwitchApp };
+
+// "Ctrl+Alt+Up" -> modifiers and virtual key. False if it can't be read.
+bool ParseHotkey(const std::wstring& text, UINT& modifiers, UINT& key) {
+    modifiers = 0;
+    key = 0;
+    size_t start = 0;
+    while (start < text.size()) {
+        size_t end = text.find(L'+', start);
+        if (end == std::wstring::npos) end = text.size();
+        std::wstring part = text.substr(start, end - start);
+        part.erase(0, part.find_first_not_of(L" \t"));
+        part.erase(part.find_last_not_of(L" \t") + 1);
+        start = end + 1;
+        auto is = [&](const wchar_t* name) { return _wcsicmp(part.c_str(), name) == 0; };
+        if (is(L"Ctrl") || is(L"Control")) modifiers |= MOD_CONTROL;
+        else if (is(L"Alt")) modifiers |= MOD_ALT;
+        else if (is(L"Shift")) modifiers |= MOD_SHIFT;
+        else if (is(L"Win") || is(L"Windows")) modifiers |= MOD_WIN;
+        else if (is(L"Space")) key = VK_SPACE;
+        else if (is(L"Left")) key = VK_LEFT;
+        else if (is(L"Right")) key = VK_RIGHT;
+        else if (is(L"Up")) key = VK_UP;
+        else if (is(L"Down")) key = VK_DOWN;
+        else if (is(L"Home")) key = VK_HOME;
+        else if (is(L"End")) key = VK_END;
+        else if (is(L"PageUp")) key = VK_PRIOR;
+        else if (is(L"PageDown")) key = VK_NEXT;
+        else if (part.size() == 1 && iswalnum(part[0])) key = towupper(part[0]); // A-Z, 0-9 share their VK codes
+        else if ((part[0] == L'F' || part[0] == L'f') && part.size() <= 3 && _wtoi(part.c_str() + 1) >= 1 &&
+                 _wtoi(part.c_str() + 1) <= 24) {
+            key = VK_F1 + _wtoi(part.c_str() + 1) - 1;
+        } else {
+            return false;
+        }
+    }
+    return key != 0 && modifiers != 0; // a bare key would swallow normal typing
+}
+
+void RegisterHotkeys() {
+    const std::pair<int, const std::wstring*> hotkeys[] = {
+        {kHotkeyPlayPause, &g.settings.hotkeyPlayPause},
+        {kHotkeyNext, &g.settings.hotkeyNext},
+        {kHotkeyPrevious, &g.settings.hotkeyPrevious},
+        {kHotkeySwitchApp, &g.settings.hotkeySwitchApp},
+    };
+    for (const auto& [id, text] : hotkeys) {
+        UnregisterHotKey(g.controller, id);
+        if (text->empty()) continue;
+        UINT modifiers, key;
+        if (!ParseHotkey(*text, modifiers, key)) {
+            Log(L"Hotkey \"%s\" isn't understood; use e.g. Ctrl+Alt+Up", text->c_str());
+        } else if (!RegisterHotKey(g.controller, id, modifiers | MOD_NOREPEAT, key)) {
+            Log(L"Hotkey %s is already used by another app", text->c_str());
+        }
+    }
+}
+
+void OnHotkey(int id) {
+    switch (id) {
+    case kHotkeyPlayPause: g.media.Send(MediaCommand::PlayPause); break;
+    case kHotkeyNext: g.media.Send(MediaCommand::Next); break;
+    case kHotkeyPrevious: g.media.Send(MediaCommand::Previous); break;
+    case kHotkeySwitchApp: g.media.SwitchSession(+1); break;
+    }
+}
+
 AppFilter FilterFrom(const Settings& s) {
     return {s.ignoredApps, s.pinnedApp, s.musicApps, s.browsers, s.preferMusicApps, s.preferNonBrowsers};
 }
@@ -940,8 +1011,13 @@ void ApplySettings(const Settings& next) {
                                next.browsers != g.settings.browsers ||
                                next.preferMusicApps != g.settings.preferMusicApps ||
                                next.preferNonBrowsers != g.settings.preferNonBrowsers;
+    const bool hotkeysChanged = next.hotkeyPlayPause != g.settings.hotkeyPlayPause ||
+                                next.hotkeyNext != g.settings.hotkeyNext ||
+                                next.hotkeyPrevious != g.settings.hotkeyPrevious ||
+                                next.hotkeySwitchApp != g.settings.hotkeySwitchApp;
     g.settings = next;
     if (filterChanged) g.media.SetFilter(FilterFrom(g.settings));
+    if (hotkeysChanged) RegisterHotkeys();
     if (g.settings.stayVisibleWhenPaused) {
         KillTimer(g.controller, kTimerIdleHide);
         g.idleHidden = false;
@@ -1286,6 +1362,9 @@ LRESULT CALLBACK ControllerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     switch (msg) {
+    case WM_HOTKEY:
+        OnHotkey(static_cast<int>(wp));
+        return 0;
     case WM_APP_APPBAR:
         if (wp == ABN_FULLSCREENAPP) {
             g.fullscreen = lp != 0 && ForegroundCoversTaskbar();
@@ -1363,6 +1442,7 @@ LRESULT CALLBACK ControllerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             KillTimer(hwnd, timer);
         }
         UnregisterAppBar();
+        for (int id : {kHotkeyPlayPause, kHotkeyNext, kHotkeyPrevious, kHotkeySwitchApp}) UnregisterHotKey(hwnd, id);
         g.controller = nullptr;
         Detach();
         PostQuitMessage(0);
@@ -1410,6 +1490,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     Log(L"Started (theme %s; threads: ui %lu, taskbar %lu, media %lu)", g.lightTheme ? L"light" : L"dark",
         GetCurrentThreadId(), g.watcher.ThreadId(), g.media.ThreadId());
     RegisterAppBar();
+    RegisterHotkeys();
     Attach();
 
     // Windows signals this handle when the settings folder changes, so hand
