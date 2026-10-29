@@ -35,6 +35,11 @@ struct MediaInfo {
     std::wstring artist;
     std::shared_ptr<const MediaArt> art;     // null when the app gives none
     std::shared_ptr<const MediaArt> appIcon; // the playing app's own icon, null if not found
+    // The cover's main color as hue (0-360) and saturation (0-1), for tinting.
+    // Absent for grey or black-and-white covers and when there's no art.
+    bool hasAccent = false;
+    float accentHue = 0;
+    float accentSaturation = 0;
     bool playing = false;
     bool canPrevious = false;
     bool canPlayPause = false;

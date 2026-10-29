@@ -11,6 +11,8 @@ struct Settings {
     // Keep showing the last track while paused instead of hiding after a delay.
     bool stayVisibleWhenPaused = false;
     UINT hideAfterPausedSeconds = 30;
+    // Color the seekbar with the cover art's main color.
+    bool artColorSeekbar = true;
 
     // Apps never to show, matched exactly (ignoring case) against the app's
     // name ("Spotify"), exe ("msedge.exe") or AppUserModelID.

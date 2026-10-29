@@ -496,6 +496,28 @@ void DrawStatic(const WidgetLayout& layout, float w, float h) {
     }
 }
 
+// The filled part of the seekbar: the cover's main color when it has one,
+// kept saturated enough to read as a color and bright (dark mode) or deep
+// (light mode) enough to stand out from the taskbar. Otherwise plain ink.
+D2D1_COLOR_F SeekbarColor(const MediaInfo& media) {
+    const float alpha = media.playing ? 1.0f : 0.65f;
+    if (!g.settings.artColorSeekbar || !media.hasAccent) return InkAt(alpha);
+    const float s = std::clamp(media.accentSaturation * 1.1f, 0.45f, 0.85f);
+    const float v = g.lightTheme ? 0.55f : 0.95f;
+    const float h = media.accentHue / 60.0f;
+    const float c = v * s, x = c * (1 - std::abs(std::fmod(h, 2.0f) - 1)), m = v - c;
+    float r = 0, gr = 0, b = 0;
+    switch (static_cast<int>(h) % 6) {
+    case 0: r = c, gr = x; break;
+    case 1: r = x, gr = c; break;
+    case 2: gr = c, b = x; break;
+    case 3: gr = x, b = c; break;
+    case 4: r = x, b = c; break;
+    default: r = c, b = x; break;
+    }
+    return D2D1::ColorF(r + m, gr + m, b + m, alpha);
+}
+
 // Seekbar along the bottom edge, clipped to the box's rounded outline so its
 // ends follow the corner curves. Display only. The filled part is at full
 // brightness so it reads at a glance against the faint track.
@@ -520,7 +542,7 @@ void DrawSeekbar(const WidgetLayout& layout, float w, float h) {
     auto filled = track;
     const float progress = static_cast<float>(media.PositionAt(NowFileTime())) / media.durationMs;
     filled.right = track.left + (track.right - track.left) * progress;
-    paint->SetColor(InkAt(media.playing ? 1.0f : 0.65f));
+    paint->SetColor(SeekbarColor(media));
     g.target->FillRectangle(filled, paint.Get());
     g.target->PopLayer();
 }

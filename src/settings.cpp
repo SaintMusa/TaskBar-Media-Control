@@ -20,6 +20,8 @@ constexpr wchar_t kTemplate[] =
     L"; 0 = hide after HideAfterPausedSeconds.\r\n"
     L"StayVisibleWhenPaused=0\r\n"
     L"HideAfterPausedSeconds=30\r\n"
+    L"; 1 = color the seekbar with the cover art's main color, 0 = plain.\r\n"
+    L"ArtColorSeekbar=1\r\n"
     L"\r\n"
     L"[Apps]\r\n"
     L"; Apps never to show, separated by ;  Use the name from the right-click\r\n"
@@ -130,6 +132,7 @@ Settings LoadSettings() {
     Settings s;
     s.stayVisibleWhenPaused = GetPrivateProfileIntW(L"General", L"StayVisibleWhenPaused", 0, path.c_str()) != 0;
     s.hideAfterPausedSeconds = GetPrivateProfileIntW(L"General", L"HideAfterPausedSeconds", 30, path.c_str());
+    s.artColorSeekbar = GetPrivateProfileIntW(L"General", L"ArtColorSeekbar", 1, path.c_str()) != 0;
     s.ignoredApps = SplitList(ReadString(L"Apps", L"Ignore", L""));
     s.pinnedApp = ReadString(L"Apps", L"Pinned", L"");
     s.preferMusicApps = GetPrivateProfileIntW(L"Apps", L"PreferMusicApps", 1, path.c_str()) != 0;
@@ -151,6 +154,7 @@ void SaveSettings(const Settings& s) {
                                path.c_str());
     WritePrivateProfileStringW(L"General", L"HideAfterPausedSeconds",
                                std::to_wstring(s.hideAfterPausedSeconds).c_str(), path.c_str());
+    WritePrivateProfileStringW(L"General", L"ArtColorSeekbar", s.artColorSeekbar ? L"1" : L"0", path.c_str());
     WritePrivateProfileStringW(L"Apps", L"Ignore", JoinList(s.ignoredApps).c_str(), path.c_str());
     WritePrivateProfileStringW(L"Apps", L"Pinned", s.pinnedApp.c_str(), path.c_str());
     WritePrivateProfileStringW(L"Apps", L"PreferMusicApps", s.preferMusicApps ? L"1" : L"0", path.c_str());

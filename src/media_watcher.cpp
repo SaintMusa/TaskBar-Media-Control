@@ -41,6 +41,8 @@ struct Tracked {
     std::wstring title;
     std::wstring artist;
     std::shared_ptr<const MediaArt> art;
+    bool hasAccent = false;
+    float accentHue = 0, accentSaturation = 0;
     // Set from Windows' callback thread when title/artist/art change. Browsers
     // send playback updates far more often than metadata ones, so we only
     // re-read the (cross-process, async) media properties when this says so.
@@ -135,6 +137,36 @@ std::shared_ptr<const MediaArt> ToArt(IWICImagingFactory* wic, IWICBitmapSource*
         return nullptr;
     }
     return art;
+}
+
+// The cover's main color: a hue average over its colorful pixels, weighted
+// toward vivid mid-bright ones so dark borders and white text don't win.
+// Runs once per track on the small decoded cover (about a thousand pixels).
+bool FindAccent(const MediaArt& art, float& hue, float& saturation) {
+    double x = 0, y = 0, saturationSum = 0, weightSum = 0;
+    const size_t count = art.pixels.size() / 4;
+    for (size_t i = 0; i < count; ++i) {
+        const BYTE* p = &art.pixels[i * 4]; // premultiplied B, G, R, A
+        if (p[3] < 128) continue;
+        const double b = p[0] * 255.0 / p[3], g = p[1] * 255.0 / p[3], r = p[2] * 255.0 / p[3];
+        const double high = std::max({r, g, b}), low = std::min({r, g, b});
+        const double value = high / 255, sat = high > 0 ? (high - low) / high : 0;
+        if (value < 0.15 || sat < 0.2) continue; // too dark or too grey to count
+        double h = 0;
+        if (high == r) h = 60 * std::fmod((g - b) / (high - low), 6.0);
+        else if (high == g) h = 60 * ((b - r) / (high - low) + 2);
+        else h = 60 * ((r - g) / (high - low) + 4);
+        const double weight = sat * (1 - std::abs(value - 0.6));
+        const double radians = h * 3.14159265358979 / 180;
+        x += weight * std::cos(radians);
+        y += weight * std::sin(radians);
+        saturationSum += weight * sat;
+        weightSum += weight;
+    }
+    if (count == 0 || weightSum < 0.05 * count) return false; // mostly grey: no accent
+    hue = static_cast<float>(std::fmod(std::atan2(y, x) * 180 / 3.14159265358979 + 360, 360.0));
+    saturation = static_cast<float>(saturationSum / weightSum);
+    return true;
 }
 
 // Decodes the thumbnail, scaled so its short side is `size`, center-cropped square.
@@ -493,6 +525,8 @@ void MediaWatcher::Run() {
                             best->title = props.Title();
                             best->artist = props.Artist();
                             best->art = DecodeThumbnail(wic.Get(), props.Thumbnail(), artSize_);
+                            best->hasAccent =
+                                best->art && FindAccent(*best->art, best->accentHue, best->accentSaturation);
                         }
                     } catch (...) {
                         // The app closed mid-query; the next SessionsChanged sorts it out.
@@ -502,6 +536,9 @@ void MediaWatcher::Run() {
                 info.title = best->title;
                 info.artist = best->artist;
                 info.art = best->art;
+                info.hasAccent = best->hasAccent;
+                info.accentHue = best->accentHue;
+                info.accentSaturation = best->accentSaturation;
                 const UINT iconSize = std::max(12u, artSize_ * 7 / 16); // a badge, under half the art
                 auto key = std::make_pair(best->appId, iconSize);
                 auto icon = appIcons.find(key);
