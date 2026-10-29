@@ -14,6 +14,10 @@ struct Settings {
     // Apps never to show, matched exactly (ignoring case) against the app's
     // name ("Spotify"), exe ("msedge.exe") or AppUserModelID.
     std::vector<std::wstring> ignoredApps;
+    // While a music app is playing it wins over every other app.
+    bool preferMusicApps = true;
+    // What counts as a music app: matched against the app's name or ID.
+    std::vector<std::wstring> musicApps;
     // Show a browser only while no other app is playing.
     bool preferNonBrowsers = false;
     // What counts as a browser: matched against the app's name or ID.

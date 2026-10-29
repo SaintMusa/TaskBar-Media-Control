@@ -15,6 +15,18 @@ struct MediaArt {
     std::vector<BYTE> pixels;
 };
 
+// One app with media, for the "Switch to" menu.
+struct SessionSummary {
+    std::wstring appId;
+    std::wstring appName;
+    std::wstring title; // empty until that session has been shown once
+    bool playing = false;
+
+    bool operator==(const SessionSummary&) const = default;
+};
+
+enum class RepeatMode { Off, One, All };
+
 // What the widget shows. Empty appId means no media session exists.
 struct MediaInfo {
     std::wstring appId;   // e.g. "Spotify.exe" or a browser's AppUserModelID
@@ -28,6 +40,13 @@ struct MediaInfo {
     bool canPlayPause = false;
     bool canNext = false;
     int sessionCount = 0; // apps with media right now; 2+ shows the switch button
+    std::vector<SessionSummary> sessions; // all of them, in switching order
+
+    // Only some apps let others change these (Spotify often doesn't, browsers rarely).
+    bool canShuffle = false;
+    bool shuffle = false;
+    bool canRepeat = false;
+    RepeatMode repeat = RepeatMode::Off;
 
     // Timeline, exactly as the app last reported it. Apps report on play,
     // pause and seek only; PositionAt() extrapolates from the clock.
@@ -43,15 +62,18 @@ struct MediaInfo {
     bool operator==(const MediaInfo&) const = default; // art compares by pointer
 };
 
-enum class MediaCommand { None, Previous, PlayPause, Next };
+enum class MediaCommand { None, Previous, PlayPause, Next, ShuffleOn, ShuffleOff, RepeatOff, RepeatOne, RepeatAll };
 
-// Which apps to leave out, and whether browsers should give way to other apps.
+// Which apps to leave out, and which kinds of app win when several play.
 struct AppFilter {
     std::vector<std::wstring> ignored;  // exact app ID or name, ignoring case
-    std::vector<std::wstring> browsers; // any of these within the app ID or name
+    std::vector<std::wstring> musicApps; // any of these within the app ID or name
+    std::vector<std::wstring> browsers;  // same
+    bool preferMusicApps = true;
     bool preferNonBrowsers = false;
 
     bool Ignores(const std::wstring& appId, const std::wstring& appName) const;
+    bool IsMusicApp(const std::wstring& appId, const std::wstring& appName) const;
     bool IsBrowser(const std::wstring& appId, const std::wstring& appName) const;
 };
 
@@ -74,6 +96,8 @@ public:
     void Send(MediaCommand command);
     // Shows the next (+1) or previous (-1) media session. Returns immediately.
     void SwitchSession(int direction);
+    // Shows this app's session, as a manual pick (like SwitchSession).
+    void ShowSession(const std::wstring& appId);
     // Applies new ignore/browser rules and re-picks the shown session.
     void SetFilter(AppFilter filter);
     // Pixel size to decode cover art at; applies from the next track.
@@ -103,5 +127,6 @@ private:
     std::mutex mutex_;
     MediaInfo latest_;
     AppFilter filter_;
+    std::wstring pendingPick_; // app ID from ShowSession, guarded by mutex_
     std::thread thread_;
 };

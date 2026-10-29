@@ -6,6 +6,8 @@ namespace {
 
 constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t kRunValue[] = L"TaskbarMedia";
+constexpr wchar_t kDefaultMusicApps[] =
+    L"Spotify;Apple Music;iTunes;Amazon Music;TIDAL;Deezer;YouTube Music;foobar2000;MusicBee;AIMP;Winamp";
 constexpr wchar_t kDefaultBrowsers[] = L"Helium;Chrome;Edge;Firefox;Brave;Opera;Vivaldi;Zen;Arc";
 
 // UTF-16 with a byte-order mark: the profile APIs then read and write
@@ -23,6 +25,10 @@ constexpr wchar_t kTemplate[] =
     L"; Apps never to show, separated by ;  Use the name from the right-click\r\n"
     L"; menu (Spotify), an exe name (msedge.exe) or an app ID.\r\n"
     L"Ignore=\r\n"
+    L"; 1 = while a music app is playing, show it over any other app.\r\n"
+    L"PreferMusicApps=1\r\n"
+    L"; What counts as a music app, separated by ;\r\n"
+    L"MusicApps=Spotify;Apple Music;iTunes;Amazon Music;TIDAL;Deezer;YouTube Music;foobar2000;MusicBee;AIMP;Winamp\r\n"
     L"; 1 = show a browser only while no other app is playing.\r\n"
     L"PreferNonBrowsers=0\r\n"
     L"; What counts as a browser, separated by ;\r\n"
@@ -83,6 +89,8 @@ Settings LoadSettings() {
     s.stayVisibleWhenPaused = GetPrivateProfileIntW(L"General", L"StayVisibleWhenPaused", 0, path.c_str()) != 0;
     s.hideAfterPausedSeconds = GetPrivateProfileIntW(L"General", L"HideAfterPausedSeconds", 30, path.c_str());
     s.ignoredApps = SplitList(ReadString(L"Apps", L"Ignore", L""));
+    s.preferMusicApps = GetPrivateProfileIntW(L"Apps", L"PreferMusicApps", 1, path.c_str()) != 0;
+    s.musicApps = SplitList(ReadString(L"Apps", L"MusicApps", kDefaultMusicApps));
     s.preferNonBrowsers = GetPrivateProfileIntW(L"Apps", L"PreferNonBrowsers", 0, path.c_str()) != 0;
     s.browsers = SplitList(ReadString(L"Apps", L"Browsers", kDefaultBrowsers));
     return s;
@@ -96,6 +104,8 @@ void SaveSettings(const Settings& s) {
     WritePrivateProfileStringW(L"General", L"HideAfterPausedSeconds",
                                std::to_wstring(s.hideAfterPausedSeconds).c_str(), path.c_str());
     WritePrivateProfileStringW(L"Apps", L"Ignore", JoinList(s.ignoredApps).c_str(), path.c_str());
+    WritePrivateProfileStringW(L"Apps", L"PreferMusicApps", s.preferMusicApps ? L"1" : L"0", path.c_str());
+    WritePrivateProfileStringW(L"Apps", L"MusicApps", JoinList(s.musicApps).c_str(), path.c_str());
     WritePrivateProfileStringW(L"Apps", L"PreferNonBrowsers", s.preferNonBrowsers ? L"1" : L"0", path.c_str());
     WritePrivateProfileStringW(L"Apps", L"Browsers", JoinList(s.browsers).c_str(), path.c_str());
 }

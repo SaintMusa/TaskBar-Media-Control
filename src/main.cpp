@@ -45,7 +45,22 @@ enum : UINT_PTR {
     kTimerMarquee,
     kTimerSettingsReload,
 };
-enum : UINT { kCmdExit = 1, kCmdStayVisible, kCmdStartWithWindows, kCmdOpenSettings };
+enum : UINT {
+    kCmdExit = 1,
+    kCmdOpenApp,
+    kCmdShuffle,
+    kCmdRepeatOff,
+    kCmdRepeatOne,
+    kCmdRepeatAll,
+    kCmdIgnoreApp,
+    kCmdPreferMusic,
+    kCmdPreferNonBrowsers,
+    kCmdStayVisible,
+    kCmdStartWithWindows,
+    kCmdOpenSettings,
+    kCmdSwitchFirst = 1000,   // + index into MediaInfo::sessions
+    kCmdUnignoreFirst = 2000, // + index into Settings::ignoredApps
+};
 
 constexpr UINT kRelayoutDelayMs = 120; // coalesces bursts while icons animate
 constexpr UINT kAttachRetryMs = 1000;  // only while Explorer is (re)starting
@@ -889,11 +904,15 @@ void OnMediaChanged() {
     Render(sameTimeline == previous ? Redraw::Seekbar : Redraw::Full);
 }
 
-AppFilter FilterFrom(const Settings& s) { return {s.ignoredApps, s.browsers, s.preferNonBrowsers}; }
+AppFilter FilterFrom(const Settings& s) {
+    return {s.ignoredApps, s.musicApps, s.browsers, s.preferMusicApps, s.preferNonBrowsers};
+}
 
 // Takes new settings (from the menu or an edit of the file) into effect.
 void ApplySettings(const Settings& next) {
-    const bool filterChanged = next.ignoredApps != g.settings.ignoredApps || next.browsers != g.settings.browsers ||
+    const bool filterChanged = next.ignoredApps != g.settings.ignoredApps || next.musicApps != g.settings.musicApps ||
+                               next.browsers != g.settings.browsers ||
+                               next.preferMusicApps != g.settings.preferMusicApps ||
                                next.preferNonBrowsers != g.settings.preferNonBrowsers;
     g.settings = next;
     if (filterChanged) g.media.SetFilter(FilterFrom(g.settings));
@@ -910,9 +929,58 @@ void OpenSettingsFile() {
     ShellExecuteW(nullptr, L"open", L"notepad.exe", (L"\"" + SettingsPath() + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
 }
 
+// Saves a changed copy of the settings and applies it.
+template <typename Change> void ChangeSettings(Change change) {
+    Settings next = g.settings;
+    change(next);
+    SaveSettings(next);
+    ApplySettings(next);
+}
+
+// The right-click menu. Media items first (only what the app supports),
+// then which apps to show, then the app's own options.
 void ShowMenu() {
-    HMENU menu = CreatePopupMenu();
+    const MediaInfo& m = g.nowPlaying;
+    const std::wstring name = m.appName.empty() ? m.appId : m.appName;
     const auto checked = [](bool on) { return MF_STRING | (on ? MF_CHECKED : MF_UNCHECKED); };
+    HMENU menu = CreatePopupMenu();
+    HMENU switchTo = nullptr, repeat = nullptr, ignored = nullptr;
+
+    if (!m.appId.empty()) AppendMenuW(menu, MF_STRING, kCmdOpenApp, (L"Open " + name).c_str());
+    if (m.sessions.size() > 1) {
+        switchTo = CreatePopupMenu();
+        for (size_t i = 0; i < m.sessions.size(); ++i) {
+            const auto& session = m.sessions[i];
+            std::wstring label = session.appName.empty() ? session.appId : session.appName;
+            if (!session.title.empty()) label += L" — " + session.title;
+            if (session.playing) label += L"  ▶";
+            AppendMenuW(switchTo, checked(session.appId == m.appId), kCmdSwitchFirst + i, label.c_str());
+        }
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(switchTo), L"Switch to");
+    }
+    if (m.canShuffle || m.canRepeat) AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    if (m.canShuffle) AppendMenuW(menu, checked(m.shuffle), kCmdShuffle, L"Shuffle");
+    if (m.canRepeat) {
+        repeat = CreatePopupMenu();
+        AppendMenuW(repeat, checked(m.repeat == RepeatMode::Off), kCmdRepeatOff, L"Off");
+        AppendMenuW(repeat, checked(m.repeat == RepeatMode::One), kCmdRepeatOne, L"Repeat this track");
+        AppendMenuW(repeat, checked(m.repeat == RepeatMode::All), kCmdRepeatAll, L"Repeat all");
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(repeat), L"Repeat");
+    }
+
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    if (!m.appId.empty()) AppendMenuW(menu, MF_STRING, kCmdIgnoreApp, (L"Never show " + name).c_str());
+    if (!g.settings.ignoredApps.empty()) {
+        ignored = CreatePopupMenu();
+        for (size_t i = 0; i < g.settings.ignoredApps.size(); ++i) {
+            AppendMenuW(ignored, MF_STRING, kCmdUnignoreFirst + i, (L"Show " + g.settings.ignoredApps[i] + L" again").c_str());
+        }
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(ignored), L"Hidden apps");
+    }
+    AppendMenuW(menu, checked(g.settings.preferMusicApps), kCmdPreferMusic, L"Music apps first");
+    AppendMenuW(menu, checked(g.settings.preferNonBrowsers), kCmdPreferNonBrowsers, L"Browsers last");
+
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, checked(g.settings.stayVisibleWhenPaused), kCmdStayVisible, L"Stay visible when paused");
     AppendMenuW(menu, checked(StartsWithWindows()), kCmdStartWithWindows, L"Start with Windows");
     AppendMenuW(menu, MF_STRING, kCmdOpenSettings, L"Open settings file");
@@ -925,16 +993,27 @@ void ShowMenu() {
     UINT cmd = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, g.controller,
                               nullptr);
     PostMessageW(g.controller, WM_NULL, 0, 0);
-    DestroyMenu(menu);
+    DestroyMenu(menu); // also destroys the submenus attached to it
 
-    switch (cmd) {
-    case kCmdStayVisible: {
-        Settings next = g.settings;
-        next.stayVisibleWhenPaused = !next.stayVisibleWhenPaused;
-        SaveSettings(next);
-        ApplySettings(next);
-        break;
+    if (cmd >= kCmdSwitchFirst && cmd < kCmdSwitchFirst + m.sessions.size()) {
+        g.media.ShowSession(m.sessions[cmd - kCmdSwitchFirst].appId);
+        return;
     }
+    if (cmd >= kCmdUnignoreFirst && cmd < kCmdUnignoreFirst + g.settings.ignoredApps.size()) {
+        const size_t index = cmd - kCmdUnignoreFirst;
+        ChangeSettings([&](Settings& s) { s.ignoredApps.erase(s.ignoredApps.begin() + index); });
+        return;
+    }
+    switch (cmd) {
+    case kCmdOpenApp: ActivateApp(m.appId); break;
+    case kCmdShuffle: g.media.Send(m.shuffle ? MediaCommand::ShuffleOff : MediaCommand::ShuffleOn); break;
+    case kCmdRepeatOff: g.media.Send(MediaCommand::RepeatOff); break;
+    case kCmdRepeatOne: g.media.Send(MediaCommand::RepeatOne); break;
+    case kCmdRepeatAll: g.media.Send(MediaCommand::RepeatAll); break;
+    case kCmdIgnoreApp: ChangeSettings([&](Settings& s) { s.ignoredApps.push_back(name); }); break;
+    case kCmdPreferMusic: ChangeSettings([](Settings& s) { s.preferMusicApps = !s.preferMusicApps; }); break;
+    case kCmdPreferNonBrowsers: ChangeSettings([](Settings& s) { s.preferNonBrowsers = !s.preferNonBrowsers; }); break;
+    case kCmdStayVisible: ChangeSettings([](Settings& s) { s.stayVisibleWhenPaused = !s.stayVisibleWhenPaused; }); break;
     case kCmdStartWithWindows: SetStartWithWindows(!StartsWithWindows()); break;
     case kCmdOpenSettings: OpenSettingsFile(); break;
     case kCmdExit: DestroyWindow(g.controller); break;

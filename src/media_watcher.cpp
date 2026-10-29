@@ -8,6 +8,7 @@
 #include <wrl/client.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.Media.h>
 #include <winrt/Windows.Media.Control.h>
 #include <winrt/Windows.Storage.Streams.h>
 #include <algorithm>
@@ -16,6 +17,8 @@
 #include <cstdint>
 #include <cwctype>
 #include <map>
+#include <tuple>
+#include <utility>
 
 using Microsoft::WRL::ComPtr;
 using namespace winrt::Windows::Media::Control;
@@ -33,6 +36,7 @@ struct Tracked {
     Session session{nullptr};
     std::wstring appId;
     std::wstring appName;
+    bool isMusic = false;
     bool isBrowser = false;
     std::wstring title;
     std::wstring artist;
@@ -46,6 +50,8 @@ struct Tracked {
     std::shared_ptr<std::atomic<bool>> isShown = std::make_shared<std::atomic<bool>>(false);
     bool wasPlaying = false;
     bool canPrevious = false, canPlayPause = false, canNext = false;
+    bool canShuffle = false, shuffle = false, canRepeat = false;
+    RepeatMode repeat = RepeatMode::Off;
     double rate = 1.0;
     uint64_t playingSince = 0; // higher = started playing more recently
     Session::MediaPropertiesChanged_revoker propertiesChanged;
@@ -56,6 +62,8 @@ struct Tracked {
 // Reads play state and which buttons the app currently allows.
 void ReadPlayback(Tracked& t) {
     t.wasPlaying = t.canPrevious = t.canPlayPause = t.canNext = false;
+    t.canShuffle = t.shuffle = t.canRepeat = false;
+    t.repeat = RepeatMode::Off;
     t.rate = 1.0;
     try {
         auto info = t.session.GetPlaybackInfo();
@@ -66,6 +74,15 @@ void ReadPlayback(Tracked& t) {
         t.canNext = controls.IsNextEnabled();
         t.canPlayPause = controls.IsPlayPauseToggleEnabled() || controls.IsPlayEnabled() || controls.IsPauseEnabled();
         if (auto rate = info.PlaybackRate(); rate && rate.Value() > 0) t.rate = rate.Value();
+        t.canShuffle = controls.IsShuffleEnabled();
+        t.canRepeat = controls.IsRepeatEnabled();
+        if (auto shuffle = info.IsShuffleActive()) t.shuffle = shuffle.Value();
+        if (auto repeat = info.AutoRepeatMode()) {
+            using winrt::Windows::Media::MediaPlaybackAutoRepeatMode;
+            t.repeat = repeat.Value() == MediaPlaybackAutoRepeatMode::Track  ? RepeatMode::One
+                       : repeat.Value() == MediaPlaybackAutoRepeatMode::List ? RepeatMode::All
+                                                                             : RepeatMode::Off;
+        }
     } catch (...) {
     }
 }
@@ -164,11 +181,17 @@ std::shared_ptr<const MediaArt> LoadAppIcon(IWICImagingFactory* wic, const std::
 }
 
 void RunCommand(const Session& session, MediaCommand command) {
+    using Repeat = winrt::Windows::Media::MediaPlaybackAutoRepeatMode;
     try {
         switch (command) {
         case MediaCommand::Previous: session.TrySkipPreviousAsync().get(); break;
         case MediaCommand::PlayPause: session.TryTogglePlayPauseAsync().get(); break;
         case MediaCommand::Next: session.TrySkipNextAsync().get(); break;
+        case MediaCommand::ShuffleOn: session.TryChangeShuffleActiveAsync(true).get(); break;
+        case MediaCommand::ShuffleOff: session.TryChangeShuffleActiveAsync(false).get(); break;
+        case MediaCommand::RepeatOff: session.TryChangeAutoRepeatModeAsync(Repeat::None).get(); break;
+        case MediaCommand::RepeatOne: session.TryChangeAutoRepeatModeAsync(Repeat::Track).get(); break;
+        case MediaCommand::RepeatAll: session.TryChangeAutoRepeatModeAsync(Repeat::List).get(); break;
         case MediaCommand::None: break;
         }
     } catch (...) {
@@ -219,6 +242,15 @@ void MediaWatcher::Send(MediaCommand command) {
     SetEvent(wakeEvent_);
 }
 
+void MediaWatcher::ShowSession(const std::wstring& appId) {
+    {
+        std::lock_guard lock(mutex_);
+        pendingPick_ = appId;
+    }
+    needsFullEvaluation_ = true;
+    SetEvent(wakeEvent_);
+}
+
 void MediaWatcher::SetFilter(AppFilter filter) {
     {
         std::lock_guard lock(mutex_);
@@ -235,16 +267,26 @@ bool AppFilter::Ignores(const std::wstring& appId, const std::wstring& appName) 
     return false;
 }
 
-bool AppFilter::IsBrowser(const std::wstring& appId, const std::wstring& appName) const {
+namespace {
+bool AnyWithin(const std::vector<std::wstring>& parts, const std::wstring& appId, const std::wstring& appName) {
     auto contains = [](const std::wstring& text, const std::wstring& part) {
         return !part.empty() && std::search(text.begin(), text.end(), part.begin(), part.end(), [](wchar_t a, wchar_t b) {
                                     return towlower(a) == towlower(b);
                                 }) != text.end();
     };
-    for (const auto& browser : browsers) {
-        if (contains(appId, browser) || contains(appName, browser)) return true;
+    for (const auto& part : parts) {
+        if (contains(appId, part) || contains(appName, part)) return true;
     }
     return false;
+}
+} // namespace
+
+bool AppFilter::IsMusicApp(const std::wstring& appId, const std::wstring& appName) const {
+    return AnyWithin(musicApps, appId, appName);
+}
+
+bool AppFilter::IsBrowser(const std::wstring& appId, const std::wstring& appName) const {
+    return AnyWithin(browsers, appId, appName);
 }
 
 void MediaWatcher::SwitchSession(int direction) {
@@ -329,6 +371,7 @@ void MediaWatcher::Run() {
                                        [&](const Tracked& t) { return t.session == session; });
                 if (it != tracked.end()) {
                     if (filter.Ignores(it->appId, it->appName)) continue;
+                    it->isMusic = filter.IsMusicApp(it->appId, it->appName);
                     it->isBrowser = filter.IsBrowser(it->appId, it->appName);
                     next.push_back(std::move(*it));
                     continue;
@@ -338,6 +381,7 @@ void MediaWatcher::Run() {
                 t.appId = session.SourceAppUserModelId();
                 t.appName = nameOf(t.appId);
                 if (filter.Ignores(t.appId, t.appName)) continue;
+                t.isMusic = filter.IsMusicApp(t.appId, t.appName);
                 t.isBrowser = filter.IsBrowser(t.appId, t.appName);
                 t.propertiesChanged = session.MediaPropertiesChanged(
                     winrt::auto_revoke, [this, stale = t.propertiesStale](auto&&, auto&&) {
@@ -363,14 +407,27 @@ void MediaWatcher::Run() {
                 picked = tracked[((from + steps) % count + count) % count].session;
                 pickedAt = playCounter;
             }
+            // Or a specific app chosen from the menu.
+            std::wstring pickApp;
+            {
+                std::lock_guard lock(mutex_);
+                pickApp = std::exchange(pendingPick_, std::wstring{});
+            }
+            for (const auto& t : tracked) {
+                if (!pickApp.empty() && t.appId == pickApp) {
+                    picked = t.session;
+                    pickedAt = playCounter;
+                }
+            }
 
-            // Most recently started playing wins. With "prefer non-browsers",
-            // any other playing app beats a browser first.
+            // Among playing apps: a music app first (if preferred), then a
+            // non-browser (if preferred), then whichever started playing last.
             Tracked* best = nullptr;
             Tracked* pick = nullptr;
             uint64_t newestStart = 0;
             auto rank = [&](const Tracked& t) {
-                return std::make_pair(filter.preferNonBrowsers && !t.isBrowser, t.playingSince);
+                return std::make_tuple(filter.preferMusicApps && t.isMusic, filter.preferNonBrowsers && !t.isBrowser,
+                                       t.playingSince);
             };
             for (auto& t : tracked) {
                 bool wasPlaying = t.wasPlaying;
@@ -428,6 +485,11 @@ void MediaWatcher::Run() {
                 info.canNext = best->canNext;
                 info.rate = best->rate;
                 info.sessionCount = static_cast<int>(tracked.size());
+                info.canShuffle = best->canShuffle;
+                info.shuffle = best->shuffle;
+                info.canRepeat = best->canRepeat;
+                info.repeat = best->repeat;
+                for (const auto& t : tracked) info.sessions.push_back({t.appId, t.appName, t.title, t.wasPlaying});
                 ReadTimeline(best->session, info);
                 shownAppId = best->appId;
                 shown = best->session;
