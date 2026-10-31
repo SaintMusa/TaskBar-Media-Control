@@ -22,6 +22,7 @@
 #include <memory>
 #include <vector>
 #include "app_info.h"
+#include "hotkey.h"
 #include "media_watcher.h"
 #include "placement.h"
 #include "popup.h"
@@ -1116,43 +1117,6 @@ void OnMediaChanged() {
 // nothing until pressed and work whichever app is in front.
 
 enum : int { kHotkeyPlayPause = 1, kHotkeyNext, kHotkeyPrevious, kHotkeySwitchApp };
-
-// "Ctrl+Alt+Up" -> modifiers and virtual key. False if it can't be read.
-bool ParseHotkey(const std::wstring& text, UINT& modifiers, UINT& key) {
-    modifiers = 0;
-    key = 0;
-    size_t start = 0;
-    while (start < text.size()) {
-        size_t end = text.find(L'+', start);
-        if (end == std::wstring::npos) end = text.size();
-        std::wstring part = text.substr(start, end - start);
-        part.erase(0, part.find_first_not_of(L" \t"));
-        part.erase(part.find_last_not_of(L" \t") + 1);
-        start = end + 1;
-        auto is = [&](const wchar_t* name) { return _wcsicmp(part.c_str(), name) == 0; };
-        if (is(L"Ctrl") || is(L"Control")) modifiers |= MOD_CONTROL;
-        else if (is(L"Alt")) modifiers |= MOD_ALT;
-        else if (is(L"Shift")) modifiers |= MOD_SHIFT;
-        else if (is(L"Win") || is(L"Windows")) modifiers |= MOD_WIN;
-        else if (is(L"Space")) key = VK_SPACE;
-        else if (is(L"Left")) key = VK_LEFT;
-        else if (is(L"Right")) key = VK_RIGHT;
-        else if (is(L"Up")) key = VK_UP;
-        else if (is(L"Down")) key = VK_DOWN;
-        else if (is(L"Home")) key = VK_HOME;
-        else if (is(L"End")) key = VK_END;
-        else if (is(L"PageUp")) key = VK_PRIOR;
-        else if (is(L"PageDown")) key = VK_NEXT;
-        else if (part.size() == 1 && iswalnum(part[0])) key = towupper(part[0]); // A-Z, 0-9 share their VK codes
-        else if ((part[0] == L'F' || part[0] == L'f') && part.size() <= 3 && _wtoi(part.c_str() + 1) >= 1 &&
-                 _wtoi(part.c_str() + 1) <= 24) {
-            key = VK_F1 + _wtoi(part.c_str() + 1) - 1;
-        } else {
-            return false;
-        }
-    }
-    return key != 0 && modifiers != 0; // a bare key would swallow normal typing
-}
 
 void RegisterHotkeys() {
     const std::pair<int, const std::wstring*> hotkeys[] = {
