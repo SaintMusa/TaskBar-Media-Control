@@ -15,9 +15,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <cwctype>
 #include <map>
-#include <tuple>
 #include <utility>
 
 using Microsoft::WRL::ComPtr;
@@ -325,51 +323,6 @@ void MediaWatcher::SetFilter(AppFilter filter) {
     SetEvent(wakeEvent_);
 }
 
-bool AppFilter::IsPinned(const std::wstring& appId, const std::wstring& appName) const {
-    return !pinned.empty() &&
-           (_wcsicmp(pinned.c_str(), appId.c_str()) == 0 || _wcsicmp(pinned.c_str(), appName.c_str()) == 0);
-}
-
-bool AppFilter::Ignores(const std::wstring& appId, const std::wstring& appName) const {
-    for (const auto& entry : ignored) {
-        if (_wcsicmp(entry.c_str(), appId.c_str()) == 0 || _wcsicmp(entry.c_str(), appName.c_str()) == 0) return true;
-    }
-    return false;
-}
-
-namespace {
-// A whole word, ignoring case, so "Arc" finds "Arc.exe" but not "Search".
-bool ContainsWord(const std::wstring& text, const std::wstring& word) {
-    if (word.empty()) return false;
-    auto next = [&](std::wstring::const_iterator from) {
-        return std::search(from, text.end(), word.begin(), word.end(),
-                           [](wchar_t a, wchar_t b) { return towlower(a) == towlower(b); });
-    };
-    for (auto found = next(text.begin()); found != text.end(); found = next(found + 1)) {
-        const auto end = found + word.size();
-        const bool startsWord = found == text.begin() || !iswalnum(*(found - 1));
-        const bool endsWord = end == text.end() || !iswalnum(*end);
-        if (startsWord && endsWord) return true;
-    }
-    return false;
-}
-
-bool AnyWithin(const std::vector<std::wstring>& words, const std::wstring& appId, const std::wstring& appName) {
-    for (const auto& word : words) {
-        if (ContainsWord(appId, word) || ContainsWord(appName, word)) return true;
-    }
-    return false;
-}
-} // namespace
-
-bool AppFilter::IsMusicApp(const std::wstring& appId, const std::wstring& appName) const {
-    return AnyWithin(musicApps, appId, appName);
-}
-
-bool AppFilter::IsBrowser(const std::wstring& appId, const std::wstring& appName) const {
-    return AnyWithin(browsers, appId, appName);
-}
-
 void MediaWatcher::SwitchSession(int direction) {
     pendingSwitch_ += direction;
     needsFullEvaluation_ = true;
@@ -535,39 +488,21 @@ void MediaWatcher::Run() {
                     }
                 }
 
-                // Among playing apps: a music app first (if preferred), then a
-                // non-browser (if preferred), then whichever started playing last.
-                Tracked* best = nullptr;
-                Tracked* pick = nullptr;
-                uint64_t newestStart = 0;
-                auto rank = [&](const Tracked& t) {
-                    return std::make_tuple(filter.preferMusicApps && t.isMusic, filter.preferNonBrowsers && !t.isBrowser,
-                                           t.playingSince);
-                };
+                // Windows sessions go in as plain facts; the rules are in ChooseSession.
+                std::vector<SessionCandidate> candidates;
+                int pickIndex = -1;
                 for (auto& t : tracked) {
-                    bool wasPlaying = t.wasPlaying;
+                    const bool wasPlaying = t.wasPlaying;
                     ReadPlayback(t);
                     if (t.wasPlaying && !wasPlaying) t.playingSince = ++playCounter;
-                    if (t.wasPlaying && (!best || rank(t) > rank(*best))) best = &t;
-                    if (t.wasPlaying) newestStart = std::max(newestStart, t.playingSince);
-                    if (picked && t.session == picked) pick = &t;
+                    if (picked && t.session == picked) pickIndex = static_cast<int>(candidates.size());
+                    candidates.push_back({t.wasPlaying, t.playingSince, t.isMusic, t.isBrowser,
+                                          filter.IsPinned(t.appId, t.appName)});
                 }
-                // A pinned app beats all of the above whenever it's open. Switching
-                // away from it still works and stays, playing or paused, until you
-                // switch again, that app closes, or the pinned app starts playing.
-                Tracked* pinned = nullptr;
-                for (auto& t : tracked) {
-                    if (filter.IsPinned(t.appId, t.appName)) pinned = &t;
-                }
-                if (pinned) {
-                    const bool swapHolds = pick && pick != pinned && pinned->playingSince <= pickedAt;
-                    best = swapHolds ? pick : pinned;
-                    if (!swapHolds) picked = nullptr;
-                } else if (pick && newestStart <= pickedAt) {
-                    best = pick;
-                } else {
-                    picked = nullptr;
-                }
+                const SessionChoice choice =
+                    ChooseSession(candidates, pickIndex, pickedAt, filter.preferMusicApps, filter.preferNonBrowsers);
+                Tracked* best = choice.index >= 0 ? &tracked[choice.index] : nullptr;
+                if (!choice.keepPick) picked = nullptr;
                 // Nothing playing: keep showing what we showed, paused.
                 for (auto& t : tracked) {
                     if (!best && t.appId == shownAppId) best = &t;

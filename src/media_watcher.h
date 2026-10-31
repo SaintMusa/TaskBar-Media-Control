@@ -1,5 +1,6 @@
 #pragma once
 #include <windows.h>
+#include "app_filter.h"
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -73,21 +74,6 @@ struct MediaInfo {
 };
 
 enum class MediaCommand { None, Previous, PlayPause, Next, ShuffleOn, ShuffleOff, RepeatOff, RepeatOne, RepeatAll };
-
-// Which apps to leave out, and which kinds of app win when several play.
-struct AppFilter {
-    std::vector<std::wstring> ignored;  // exact app ID or name, ignoring case
-    std::wstring pinned;                // same matching; shown whenever it's open
-    std::vector<std::wstring> musicApps; // any of these as a whole word in the app ID or name
-    std::vector<std::wstring> browsers;  // same
-    bool preferMusicApps = true;
-    bool preferNonBrowsers = false;
-
-    bool Ignores(const std::wstring& appId, const std::wstring& appName) const;
-    bool IsPinned(const std::wstring& appId, const std::wstring& appName) const;
-    bool IsMusicApp(const std::wstring& appId, const std::wstring& appName) const;
-    bool IsBrowser(const std::wstring& appId, const std::wstring& appName) const;
-};
 
 // Follows the Windows media sessions (GlobalSystemMediaTransportControls).
 //

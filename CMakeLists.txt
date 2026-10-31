@@ -8,6 +8,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 add_executable(TaskbarMedia WIN32
     src/main.cpp
+    src/app_filter.cpp
     src/app_info.cpp
     src/taskbar_watcher.cpp
     src/media_watcher.cpp
@@ -21,3 +22,9 @@ target_compile_definitions(TaskbarMedia PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_
 target_compile_options(TaskbarMedia PRIVATE /W4 /permissive- /utf-8 /bigobj)
 # windowsapp: C++/WinRT, for the Windows media session API.
 target_link_libraries(TaskbarMedia PRIVATE d2d1 dwrite ole32 oleaut32 uuid windowsapp windowscodecs shcore shell32 version comctl32 dwmapi)
+
+enable_testing()
+add_executable(AppFilterTests tests/app_filter_test.cpp src/app_filter.cpp)
+target_include_directories(AppFilterTests PRIVATE src)
+target_compile_options(AppFilterTests PRIVATE /W4 /permissive- /utf-8)
+add_test(NAME AppFilterTests COMMAND AppFilterTests)

@@ -47,7 +47,11 @@ cmake --build build
 ```
 
 The result is a single file, `build\TaskbarMedia.exe`, with no extra runtime
-to install.
+to install. To run the tests:
+
+```powershell
+ctest --test-dir build --output-on-failure
+```
 
 ## Use
 
@@ -92,7 +96,8 @@ is injected into Explorer and no system files are changed.
 | `src/main.cpp` | The widget window, layout, drawing (Direct2D in software mode), menu and tooltip. A hidden window listens for Windows broadcasts such as Explorer restarts and theme changes. |
 | `src/popup.*` | The pop-up player: its own window with Windows 11 acrylic, created on open and destroyed on close. |
 | `src/taskbar_watcher.*` | Finds the Start and Widgets buttons with UI Automation, on its own thread, to know where the free space is. |
-| `src/media_watcher.*` | Follows the Windows media sessions (`GlobalSystemMediaTransportControls`) on one worker thread, picks which one to show, and decodes cover art and app icons. |
+| `src/media_watcher.*` | Follows the Windows media sessions (`GlobalSystemMediaTransportControls`) on one worker thread and decodes cover art and app icons. |
+| `src/app_filter.*` | The rules for which app to show, kept free of Windows objects so `tests/` can check them. |
 | `src/app_info.*` | The app behind a session: its name, exe and windows (to open it). |
 | `src/settings.*` | Reading and writing `settings.ini`, and the Start with Windows entry. |
 | `src/volume.*` | Changing one app's volume through the Windows audio session API. |
