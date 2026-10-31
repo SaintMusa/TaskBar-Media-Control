@@ -13,6 +13,7 @@
 #include <dwrite.h>
 #include <wrl/client.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -74,6 +75,7 @@ enum : UINT {
 
 constexpr UINT kRelayoutDelayMs = 120; // coalesces bursts while icons animate
 constexpr UINT kAttachRetryMs = 1000;  // only while Explorer is (re)starting
+constexpr int kMaxSettleReads = 12;    // ~1.5 s of re-reading while the icons move
 constexpr UINT kWheelRestMs = 300;     // wheel quiet this long = the scroll gesture ended
 constexpr UINT kSettingsSettleMs = 200; // editors save in several writes; reload once after
 constexpr UINT kFlashMs = 1500;         // how long volume or seek feedback shows
@@ -211,6 +213,8 @@ struct State {
     ULONGLONG fadeStart = 0;
     std::vector<BYTE> fadeFrom, fadeTo;
 
+    std::array<LONG, 5> geoSignature{}; // what the last taskbar read found, to tell when it has settled
+    int geoSettleReads = 0;             // reads in a row that found something new
     RECT placed{}; // widget rect, relative to the taskbar
     UINT dpi = 96;
     bool lightTheme = false;
@@ -971,6 +975,23 @@ void ApplyGeometry() {
         g.fits = false;
         UpdateVisibility();
         return;
+    }
+
+    // Icons glide to their new places when the alignment changes or apps open, and
+    // Windows doesn't always say when they land, so a read mid-glide is stale. Read
+    // again until two reads in a row agree (or give up, so a taskbar that never
+    // sits still can't keep us reading forever).
+    const std::array<LONG, 5> signature{geo.startButton.left, geo.icons.left, geo.icons.right,
+                                        geo.rightObstacleLeft, geo.widgetsButton.left};
+    if (signature != g.geoSignature) {
+        g.geoSignature = signature;
+        if (g.geoSettleReads < kMaxSettleReads) {
+            ++g.geoSettleReads;
+            ScheduleRelayout();
+            return;
+        }
+    } else {
+        g.geoSettleReads = 0;
     }
 
     const RECT& bar = geo.taskbarRect;
