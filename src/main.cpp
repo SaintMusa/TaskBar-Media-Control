@@ -49,6 +49,7 @@ enum : UINT_PTR {
     kTimerSettingsReload,
     kTimerFlash,
     kTimerFade,
+    kTimerNoMedia,
 };
 enum : UINT {
     kCmdExit = 1,
@@ -74,6 +75,7 @@ constexpr UINT kAttachRetryMs = 1000;  // only while Explorer is (re)starting
 constexpr UINT kWheelRestMs = 300;     // wheel quiet this long = the scroll gesture ended
 constexpr UINT kSettingsSettleMs = 200; // editors save in several writes; reload once after
 constexpr UINT kFlashMs = 1500;         // how long volume or seek feedback shows
+constexpr UINT kNoMediaGraceMs = 3000;  // a new session this soon counts as the same media carrying on
 constexpr float kVolumeStep = 0.05f;    // per wheel notch
 constexpr int64_t kSeekStepMs = 5000;   // per wheel notch
 constexpr ULONGLONG kFadeMs = 220;      // cross-fade between tracks
@@ -180,6 +182,7 @@ struct State {
     bool fits = false;       // the taskbar has room for us
     bool fullscreen = false; // a full screen app or game is in front
     bool idleHidden = false; // media has been paused for settings.hideAfterPausedSeconds
+    bool noMediaPending = false; // the last app's media ended; kTimerNoMedia is running
     Settings settings;
 
     HDC memDC = nullptr;
@@ -1004,10 +1007,11 @@ void UnregisterAppBar() {
     SHAppBarMessage(ABM_REMOVE, &data);
 }
 
-void OnMediaChanged() {
+void ApplyLatestMedia() {
     const MediaInfo previous = g.nowPlaying;
     g.nowPlaying = g.media.Latest();
     const MediaInfo& m = g.nowPlaying;
+    if (m.appId.empty()) ClosePopup(); // nothing left for it to show
     if (m.appId != previous.appId || m.title != previous.title || m.playing != previous.playing) {
         Log(L"Media: [%s] %s — %s (%s%s)", m.appId.c_str(), m.title.c_str(), m.artist.c_str(),
             m.playing ? L"playing" : L"paused", m.hasTimeline ? L", has timeline" : L"");
@@ -1033,6 +1037,23 @@ void OnMediaChanged() {
     sameTimeline.positionMs = previous.positionMs;
     sameTimeline.reportedAt = previous.reportedAt;
     Render(sameTimeline == previous ? Redraw::Seekbar : Redraw::Full);
+}
+
+// Browsers drop their media session while the next video loads, then make a
+// new one. Waiting a moment before accepting "no media" keeps the widget from
+// vanishing in between, and the next track cross-fades in as usual.
+void OnMediaChanged() {
+    const bool mediaEnded = g.media.Latest().appId.empty() && !g.nowPlaying.appId.empty();
+    if (mediaEnded) {
+        if (!g.noMediaPending) {
+            g.noMediaPending = true;
+            SetTimer(g.controller, kTimerNoMedia, kNoMediaGraceMs, nullptr);
+        }
+        return;
+    }
+    KillTimer(g.controller, kTimerNoMedia);
+    g.noMediaPending = false;
+    ApplyLatestMedia();
 }
 
 // ---------------------------------------------------------------------------
@@ -1558,6 +1579,9 @@ LRESULT CALLBACK ControllerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (wp == kTimerFade) {
             SetTimer(hwnd, kTimerFade, kFadeFrameMs, nullptr); // FadeTick stops it when done
             FadeTick();
+        } else if (wp == kTimerNoMedia) {
+            g.noMediaPending = false;
+            ApplyLatestMedia();
         } else if (wp == kTimerFlash) {
             g.flashText.clear();
             Render();
@@ -1597,7 +1621,7 @@ LRESULT CALLBACK ControllerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 average(g.marqueeTicks, g.marqueeRenders), average(g.presentTicks, total));
         }
         for (UINT_PTR timer : {kTimerRelayout, kTimerAttachRetry, kTimerProgress, kTimerIdleHide, kTimerWheelRest,
-                               kTimerMarquee, kTimerSettingsReload, kTimerFlash, kTimerFade}) {
+                               kTimerMarquee, kTimerSettingsReload, kTimerFlash, kTimerFade, kTimerNoMedia}) {
             KillTimer(hwnd, timer);
         }
         ClosePopup();
