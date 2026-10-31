@@ -32,6 +32,17 @@ namespace {
 // playback state). Waiting this long after the last one evaluates them once.
 constexpr DWORD kCoalesceMs = 50;
 constexpr DWORD kRetryAfterErrorMs = 1000;
+constexpr std::chrono::seconds kAppTimeout{5};
+
+// Waits for a call into another app, giving up if it has stopped responding:
+// everything here runs on one thread, so a frozen app mustn't hold up the rest.
+template <typename Operation> auto Finish(Operation operation) {
+    if (operation.wait_for(kAppTimeout) == winrt::Windows::Foundation::AsyncStatus::Started) {
+        operation.Cancel();
+        throw winrt::hresult_error(HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+    }
+    return operation.GetResults();
+}
 
 struct Tracked {
     Session session{nullptr};
@@ -176,7 +187,7 @@ std::shared_ptr<const MediaArt> DecodeThumbnail(IWICImagingFactory* wic, const I
                                                 UINT size) {
     if (!wic || !ref || size == 0) return nullptr;
     try {
-        auto stream = ref.OpenReadAsync().get();
+        auto stream = Finish(ref.OpenReadAsync());
         ComPtr<IStream> source;
         ComPtr<IWICBitmapDecoder> decoder;
         ComPtr<IWICBitmapFrameDecode> frame;
@@ -220,14 +231,14 @@ void RunCommand(const Session& session, MediaCommand command) {
     using Repeat = winrt::Windows::Media::MediaPlaybackAutoRepeatMode;
     try {
         switch (command) {
-        case MediaCommand::Previous: session.TrySkipPreviousAsync().get(); break;
-        case MediaCommand::PlayPause: session.TryTogglePlayPauseAsync().get(); break;
-        case MediaCommand::Next: session.TrySkipNextAsync().get(); break;
-        case MediaCommand::ShuffleOn: session.TryChangeShuffleActiveAsync(true).get(); break;
-        case MediaCommand::ShuffleOff: session.TryChangeShuffleActiveAsync(false).get(); break;
-        case MediaCommand::RepeatOff: session.TryChangeAutoRepeatModeAsync(Repeat::None).get(); break;
-        case MediaCommand::RepeatOne: session.TryChangeAutoRepeatModeAsync(Repeat::Track).get(); break;
-        case MediaCommand::RepeatAll: session.TryChangeAutoRepeatModeAsync(Repeat::List).get(); break;
+        case MediaCommand::Previous: Finish(session.TrySkipPreviousAsync()); break;
+        case MediaCommand::PlayPause: Finish(session.TryTogglePlayPauseAsync()); break;
+        case MediaCommand::Next: Finish(session.TrySkipNextAsync()); break;
+        case MediaCommand::ShuffleOn: Finish(session.TryChangeShuffleActiveAsync(true)); break;
+        case MediaCommand::ShuffleOff: Finish(session.TryChangeShuffleActiveAsync(false)); break;
+        case MediaCommand::RepeatOff: Finish(session.TryChangeAutoRepeatModeAsync(Repeat::None)); break;
+        case MediaCommand::RepeatOne: Finish(session.TryChangeAutoRepeatModeAsync(Repeat::Track)); break;
+        case MediaCommand::RepeatAll: Finish(session.TryChangeAutoRepeatModeAsync(Repeat::List)); break;
         case MediaCommand::None: break;
         }
     } catch (...) {
@@ -275,6 +286,13 @@ MediaInfo MediaWatcher::Latest() {
 
 void MediaWatcher::Send(MediaCommand command) {
     pendingCommand_ = static_cast<int>(command);
+    SetEvent(wakeEvent_);
+}
+
+void MediaWatcher::SetArtSize(UINT pixels) {
+    if (artSize_.exchange(pixels) == pixels) return;
+    artSizeChanged_ = true;
+    needsFullEvaluation_ = true;
     SetEvent(wakeEvent_);
 }
 
@@ -381,6 +399,14 @@ void MediaWatcher::Run() {
             return name->second;
         };
 
+        // Commands and seeks end their pass early, and one wake can carry several
+        // requests. Without this, the rest would wait for the app's next event.
+        auto wakeIfMoreWaiting = [this] {
+            if (pendingCommand_ != 0 || pendingSeekMs_ >= 0 || pendingSwitch_ != 0 || needsFullEvaluation_) {
+                SetEvent(wakeEvent_);
+            }
+        };
+
         HANDLE waits[] = {stopEvent_, wakeEvent_};
         while (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
             try {
@@ -395,14 +421,16 @@ void MediaWatcher::Run() {
                 if (auto command = static_cast<MediaCommand>(pendingCommand_.exchange(0));
                     command != MediaCommand::None && shown) {
                     RunCommand(shown, command); // the app's update event re-wakes us with the new state
+                    wakeIfMoreWaiting();
                     continue;
                 }
                 if (const int64_t seekMs = pendingSeekMs_.exchange(-1); seekMs >= 0 && shown) {
                     try {
                         const int64_t ticks = (Latest().startMs + seekMs) * 10000; // the API counts 100 ns units
-                        shown.TryChangePlaybackPositionAsync(ticks).get();
+                        Finish(shown.TryChangePlaybackPositionAsync(ticks));
                     } catch (...) {
                     }
+                    wakeIfMoreWaiting();
                     continue; // the app reports its new timeline, which wakes us
                 }
 
@@ -468,6 +496,11 @@ void MediaWatcher::Run() {
                     next.push_back(std::move(t));
                 }
                 tracked = std::move(next);
+
+                // Covers already decoded are the wrong size now; decode them again when shown.
+                if (artSizeChanged_.exchange(false)) {
+                    for (auto& t : tracked) *t.propertiesStale = true;
+                }
 
                 // Scrolling steps through sessions in a stable order, wrapping around.
                 if (int steps = pendingSwitch_.exchange(0); steps != 0 && tracked.size() > 1) {
@@ -548,7 +581,7 @@ void MediaWatcher::Run() {
                     const bool needsLarge = largeSize && (!best->largeArt || best->largeArt->size != largeSize);
                     if (stale || needsLarge) {
                         try {
-                            if (auto props = best->session.TryGetMediaPropertiesAsync().get()) {
+                            if (auto props = Finish(best->session.TryGetMediaPropertiesAsync())) {
                                 if (stale) {
                                     best->title = props.Title();
                                     best->artist = props.Artist();
@@ -595,7 +628,7 @@ void MediaWatcher::Run() {
                         for (auto& t : tracked) {
                             if (&t == best || !t.propertiesStale->exchange(false)) continue;
                             try {
-                                if (auto props = t.session.TryGetMediaPropertiesAsync().get()) {
+                                if (auto props = Finish(t.session.TryGetMediaPropertiesAsync())) {
                                     t.title = props.Title();
                                     t.artist = props.Artist();
                                     t.art = DecodeThumbnail(wic.Get(), props.Thumbnail(), artSize_);

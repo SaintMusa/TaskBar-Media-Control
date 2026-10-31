@@ -114,8 +114,8 @@ public:
     void ShowSession(const std::wstring& appId);
     // Applies new ignore/browser rules and re-picks the shown session.
     void SetFilter(AppFilter filter);
-    // Pixel size to decode cover art at; applies from the next track.
-    void SetArtSize(UINT pixels) { artSize_ = pixels; }
+    // Pixel size to decode cover art at. A change redecodes the current cover.
+    void SetArtSize(UINT pixels);
     // Also decode the cover at this size (for the pop-up), and fetch title and
     // art for every listed app; 0 drops the big cover again.
     void SetLargeArtSize(UINT pixels);
@@ -138,6 +138,7 @@ private:
     std::atomic<int> pendingSwitch_{0};
     std::atomic<int64_t> pendingSeekMs_{-1}; // -1 = no seek waiting
     std::atomic<UINT> artSize_{32};
+    std::atomic<bool> artSizeChanged_{false};
     std::atomic<UINT> largeArtSize_{0};
     HWND notifyWnd_ = nullptr;
     UINT changedMsg_ = 0;
