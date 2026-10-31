@@ -11,6 +11,8 @@ struct TaskbarGeometry {
     RECT taskbarRect{};
     RECT startButton{};
     RECT widgetsButton{};
+    RECT icons{};              // the whole strip of taskbar buttons, Start included
+    LONG rightObstacleLeft = LONG_MAX; // left edge of the first thing right of the icons (tray, another app's window)
 };
 
 // Reads taskbar button positions with UI Automation on its own thread, and

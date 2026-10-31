@@ -22,6 +22,7 @@
 #include <vector>
 #include "app_info.h"
 #include "media_watcher.h"
+#include "placement.h"
 #include "popup.h"
 #include "settings.h"
 #include "taskbar_watcher.h"
@@ -960,8 +961,8 @@ void UpdateVisibility() {
     ScheduleMarquee();
 }
 
-// Free space on a centered taskbar: between the left edge (or the Widgets
-// button) and the Start button, which leads the centered icon group.
+// Free space: left of the icons when they're centered, otherwise right of them
+// (see ChoosePlacement).
 void ApplyGeometry() {
     TaskbarGeometry geo = g.watcher.Latest();
     if (!g.widget || geo.taskbar != g.taskbar) return;
@@ -973,20 +974,39 @@ void ApplyGeometry() {
     }
 
     const RECT& bar = geo.taskbarRect;
-    int gapLeft = IsRectEmpty(&geo.widgetsButton) ? bar.left : geo.widgetsButton.right;
-    int gapRight = geo.startButton.left;
-    int available = gapRight - gapLeft - 2 * Scale(kMargin);
-    int width = std::min(Scale(kPreferredWidth), available);
-    if (width < Scale(kMinWidth)) {
-        Log(L"Only %d px free left of Start", available);
+    PlacementInput input;
+    input.barLeft = bar.left;
+    input.barRight = bar.right;
+    input.startLeft = geo.startButton.left;
+    input.hasWidgetsButton = !IsRectEmpty(&geo.widgetsButton);
+    input.widgetsLeft = geo.widgetsButton.left;
+    input.widgetsRight = geo.widgetsButton.right;
+    input.hasIcons = !IsRectEmpty(&geo.icons);
+    input.iconsRight = geo.icons.right;
+    input.rightObstacleLeft = geo.rightObstacleLeft;
+    input.margin = Scale(kMargin);
+    input.preferredWidth = Scale(kPreferredWidth);
+    input.minWidth = Scale(kMinWidth);
+    static LONG loggedIconsRight = -1, loggedObstacle = -1;
+    if (geo.icons.right != loggedIconsRight || geo.rightObstacleLeft != loggedObstacle) {
+        loggedIconsRight = geo.icons.right;
+        loggedObstacle = geo.rightObstacleLeft;
+        Log(L"Icons end at x=%ld; next thing on the right starts at x=%ld", geo.icons.right,
+            geo.rightObstacleLeft);
+    }
+    const Placement place = ChoosePlacement(input);
+    if (!place.fits) {
+        Log(L"Only %d px free on the taskbar", place.available);
         g.fits = false;
         UpdateVisibility();
         return;
     }
+    const int width = place.width;
+    const int available = place.available;
 
     int barHeight = bar.bottom - bar.top;
     int height = barHeight - 2 * Scale(kVerticalInset);
-    RECT next{gapLeft + Scale(kMargin) - bar.left, (barHeight - height) / 2, 0, 0};
+    RECT next{place.left - bar.left, (barHeight - height) / 2, 0, 0};
     next.right = next.left + width;
     next.bottom = next.top + height;
 
@@ -997,7 +1017,8 @@ void ApplyGeometry() {
     if (!EqualRect(&next, &g.placed)) {
         g.placed = next;
         SetWindowPos(g.widget, HWND_TOP, next.left, next.top, width, height, SWP_NOACTIVATE);
-        Log(L"Placed at x=%ld w=%d h=%d (free %d px, Start at %ld)", next.left, width, height, available,
+        Log(L"Placed %s at x=%ld w=%d h=%d (free %d px, Start at %ld)",
+            place.rightOfIcons ? L"right of the icons" : L"left of the icons", next.left, width, height, available,
             geo.startButton.left);
         Render();
     }

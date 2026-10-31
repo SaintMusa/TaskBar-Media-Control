@@ -2,6 +2,9 @@
 #include <ole2.h> // WIN32_LEAN_AND_MEAN leaves out the COM headers UIA expects
 #include <uiautomation.h>
 #include <wrl/client.h>
+#include <algorithm>
+#include <climits>
+#include <cwchar>
 
 using Microsoft::WRL::ComPtr;
 
@@ -72,6 +75,35 @@ RECT VisibleRect(IUIAutomationElement* element) {
     return rect;
 }
 
+// Where the free space to the right of the icons ends: the system tray, or a
+// window another app placed on the taskbar (TrafficMonitor does). Win32 child
+// windows are checked as well as UIA because some of these have no UIA element.
+LONG FirstObstacleRightOf(HWND taskbar, LONG from, const RECT& tray) {
+    struct Search {
+        LONG from;
+        LONG nearest;
+    } search{from, IsRectEmpty(&tray) ? LONG_MAX : tray.left};
+    EnumChildWindows(
+        taskbar,
+        [](HWND child, LPARAM lp) -> BOOL {
+            auto& s = *reinterpret_cast<Search*>(lp);
+            wchar_t name[64];
+            // Our own widget; and the XAML host, which spans the whole taskbar.
+            if (!GetClassNameW(child, name, ARRAYSIZE(name)) || wcscmp(name, L"TaskbarMedia.Widget") == 0 ||
+                wcscmp(name, L"Windows.UI.Composition.DesktopWindowContentBridge") == 0 ||
+                !IsWindowVisible(child)) {
+                return TRUE;
+            }
+            RECT rect;
+            if (GetWindowRect(child, &rect) && rect.right > rect.left && rect.left >= s.from) {
+                s.nearest = std::min(s.nearest, rect.left);
+            }
+            return TRUE; // keep looking: the nearest one counts
+        },
+        reinterpret_cast<LPARAM>(&search));
+    return search.nearest;
+}
+
 } // namespace
 
 bool TaskbarWatcher::Start(HWND notifyWnd, UINT geometryMsg, UINT changedMsg) {
@@ -117,7 +149,7 @@ void TaskbarWatcher::Run() {
         handler.Attach(new Handler(notifyWnd_, changedMsg_));
 
         HWND subscribedTo = nullptr;
-        ComPtr<IUIAutomationElement> start, widgets;
+        ComPtr<IUIAutomationElement> start, widgets, repeater, tray;
 
         // Finds the elements once per taskbar and subscribes to the events that
         // signal a layout change. Re-runs only after Explorer restarts or an element dies.
@@ -125,18 +157,37 @@ void TaskbarWatcher::Run() {
             uia->RemoveAllEventHandlers();
             start.Reset();
             widgets.Reset();
+            repeater.Reset();
+            tray.Reset();
             subscribedTo = nullptr;
 
             ComPtr<IUIAutomationElement> root;
             if (FAILED(uia->ElementFromHandle(taskbar, &root)) || !root) return;
             start = FindByAutomationId(uia.Get(), root.Get(), L"StartButton");
             widgets = FindByAutomationId(uia.Get(), root.Get(), L"WidgetsButton");
-
-            // The centered icon group shifts the Start button when apps open or close.
+            // The group holding every icon. It's a layout container that UIA hides from
+            // searches, so ask for Start's parent in the raw tree and check what we got.
             if (start) {
-                PROPERTYID bounds = UIA_BoundingRectanglePropertyId;
-                uia->AddPropertyChangedEventHandlerNativeArray(start.Get(), TreeScope_Element, nullptr,
-                                                               handler.Get(), &bounds, 1);
+                ComPtr<IUIAutomationTreeWalker> raw;
+                ComPtr<IUIAutomationElement> parent;
+                BSTR id = nullptr;
+                if (SUCCEEDED(uia->get_RawViewWalker(&raw)) && SUCCEEDED(raw->GetParentElement(start.Get(), &parent)) &&
+                    parent && SUCCEEDED(parent->get_CurrentAutomationId(&id)) && id &&
+                    wcscmp(id, L"TaskbarFrameRepeater") == 0) {
+                    repeater = parent;
+                }
+                SysFreeString(id);
+            }
+            tray =FindByAutomationId(uia.Get(), root.Get(), L"SystemTrayIcon");           // the first tray button
+
+            // A centered icon group shifts the Start button when apps open or close; a
+            // left-aligned one keeps Start put and grows, so its own size is watched too.
+            PROPERTYID bounds = UIA_BoundingRectanglePropertyId;
+            for (IUIAutomationElement* watched : {start.Get(), repeater.Get()}) {
+                if (watched) {
+                    uia->AddPropertyChangedEventHandlerNativeArray(watched, TreeScope_Element, nullptr,
+                                                                   handler.Get(), &bounds, 1);
+                }
             }
             // Buttons being added or removed. Only the XAML frame: our own window
             // sits outside it, so moving ourselves can't trigger a feedback loop.
@@ -162,6 +213,15 @@ void TaskbarWatcher::Run() {
                 geometry.startButton = VisibleRect(start.Get());
             }
             geometry.widgetsButton = VisibleRect(widgets.Get());
+            geometry.icons = VisibleRect(repeater.Get());
+            if (!IsRectEmpty(&geometry.icons)) {
+                const RECT trayRect = VisibleRect(tray.Get());
+                geometry.rightObstacleLeft = FirstObstacleRightOf(taskbar, geometry.icons.right, trayRect);
+                // The Widgets button sits right of the icons in some layouts.
+                if (geometry.widgetsButton.left >= geometry.icons.right) {
+                    geometry.rightObstacleLeft = std::min(geometry.rightObstacleLeft, geometry.widgetsButton.left);
+                }
+            }
 
             {
                 std::lock_guard lock(mutex_);

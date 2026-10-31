@@ -12,6 +12,7 @@ add_executable(TaskbarMedia WIN32
     src/app_info.cpp
     src/taskbar_watcher.cpp
     src/media_watcher.cpp
+    src/placement.cpp
     src/popup.cpp
     src/settings.cpp
     src/volume.cpp
@@ -28,3 +29,8 @@ add_executable(AppFilterTests tests/app_filter_test.cpp src/app_filter.cpp)
 target_include_directories(AppFilterTests PRIVATE src)
 target_compile_options(AppFilterTests PRIVATE /W4 /permissive- /utf-8)
 add_test(NAME AppFilterTests COMMAND AppFilterTests)
+
+add_executable(PlacementTests tests/placement_test.cpp src/placement.cpp)
+target_include_directories(PlacementTests PRIVATE src)
+target_compile_options(PlacementTests PRIVATE /W4 /permissive- /utf-8)
+add_test(NAME PlacementTests COMMAND PlacementTests)

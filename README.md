@@ -32,8 +32,8 @@ browsers (YouTube, Twitch) and media players.
 
 ## Requirements
 
-- Windows 11, with the taskbar icons centered (the widget uses the empty
-  space left of them)
+- Windows 11. The widget uses the empty space left of centered icons, or right
+  of the icons when they are left-aligned
 - To build: Visual Studio 2026 with the "Desktop development with C++"
   workload (includes CMake, Ninja and the Windows SDK)
 
@@ -95,7 +95,8 @@ is injected into Explorer and no system files are changed.
 |---|---|
 | `src/main.cpp` | The widget window, layout, drawing (Direct2D in software mode), menu and tooltip. A hidden window listens for Windows broadcasts such as Explorer restarts and theme changes. |
 | `src/popup.*` | The pop-up player: its own window with Windows 11 acrylic, created on open and destroyed on close. |
-| `src/taskbar_watcher.*` | Finds the Start and Widgets buttons with UI Automation, on its own thread, to know where the free space is. |
+| `src/taskbar_watcher.*` | Finds the Start and Widgets buttons, the whole icon strip and the system tray with UI Automation, on its own thread, to know where the free space is. |
+| `src/placement.*` | Decides which side of the icons the widget goes on and how wide it is, from plain numbers, so `tests/` can check it. |
 | `src/media_watcher.*` | Follows the Windows media sessions (`GlobalSystemMediaTransportControls`) on one worker thread and decodes cover art and app icons. |
 | `src/app_filter.*` | The rules for which app to show, kept free of Windows objects so `tests/` can check them. |
 | `src/app_info.*` | The app behind a session: its name, exe and windows (to open it). |
@@ -111,8 +112,10 @@ and the widget is visible. When idle it uses no CPU.
 ## Known limitations
 
 - Only the main monitor's taskbar
-- Needs the taskbar icons centered; with left-aligned icons there is no room
-  and the widget stays hidden
+- The widget needs 160 px of free taskbar. It hides when many open apps use up
+  the space, and returns when there is room again
+- With left-aligned icons it shrinks to stop short of other apps' taskbar
+  windows (for example TrafficMonitor), rather than covering them
 - Browsers report one media session for the whole browser, so with several
   tabs playing, only the one the browser picks is shown
 - Some apps do not report a playback position, so no seekbar is shown for them
