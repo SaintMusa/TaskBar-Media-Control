@@ -11,6 +11,7 @@ add_executable(TaskbarMedia WIN32
     src/app_filter.cpp
     src/app_info.cpp
     src/hotkey.cpp
+    src/list_text.cpp
     src/taskbar_watcher.cpp
     src/media_watcher.cpp
     src/placement.cpp
@@ -41,3 +42,8 @@ target_include_directories(HotkeyTests PRIVATE src)
 target_compile_options(HotkeyTests PRIVATE /W4 /permissive- /utf-8)
 target_compile_definitions(HotkeyTests PRIVATE NOMINMAX)
 add_test(NAME HotkeyTests COMMAND HotkeyTests)
+
+add_executable(ListTextTests tests/list_text_test.cpp src/list_text.cpp)
+target_include_directories(ListTextTests PRIVATE src)
+target_compile_options(ListTextTests PRIVATE /W4 /permissive- /utf-8)
+add_test(NAME ListTextTests COMMAND ListTextTests)
