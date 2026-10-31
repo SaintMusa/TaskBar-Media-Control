@@ -82,9 +82,9 @@ struct PopupState {
     ComPtr<IDWriteTextFormat> titleFormat, artistFormat, headerFormat, timeLeftFormat, timeRightFormat;
     ComPtr<IDWriteTextFormat> iconFormat, playIconFormat, placeholderFormat;
     ComPtr<ID2D1Bitmap> largeArt, smallArt, icon;
-    std::vector<std::pair<const MediaArt*, ComPtr<ID2D1Bitmap>>> rowArt; // the list's covers
+    std::vector<std::pair<std::shared_ptr<const MediaArt>, ComPtr<ID2D1Bitmap>>> rowArt; // the list's covers
     ComPtr<IDWriteTextFormat> rowTitleFormat, rowDetailFormat, rowIconFormat;
-    const MediaArt *largeArtSource = nullptr, *smallArtSource = nullptr, *iconSource = nullptr;
+    std::shared_ptr<const MediaArt> largeArtSource, smallArtSource, iconSource;
     HDC memDC = nullptr;
     HBITMAP bitmap = nullptr;
     HGDIOBJ oldBitmap = nullptr;
@@ -315,8 +315,10 @@ bool EnsureGraphics(SIZE size) {
            p.rowIconFormat;
 }
 
-// Uploads an image to a Direct2D bitmap once, when it changes.
-ID2D1Bitmap* Uploaded(const MediaArt* image, ComPtr<ID2D1Bitmap>& bitmap, const MediaArt*& uploadedFrom) {
+// Uploads an image to a Direct2D bitmap once, when it changes. uploadedFrom keeps
+// the image alive, so a new cover can't reuse its address and look unchanged.
+ID2D1Bitmap* Uploaded(const std::shared_ptr<const MediaArt>& image, ComPtr<ID2D1Bitmap>& bitmap,
+                      std::shared_ptr<const MediaArt>& uploadedFrom) {
     if (image != uploadedFrom) {
         bitmap.Reset();
         uploadedFrom = image;
@@ -354,7 +356,7 @@ void DrawNowPlaying(const MediaInfo& m, ID2D1SolidColorBrush* paint) {
     // Header: the app's icon and name, so it's clear where the sound comes from.
     const auto header = HeaderRect();
     float textLeft = header.left;
-    if (ID2D1Bitmap* icon = Uploaded(m.appIcon.get(), p.icon, p.iconSource)) {
+    if (ID2D1Bitmap* icon = Uploaded(m.appIcon, p.icon, p.iconSource)) {
         const float top = header.top + (header.bottom - header.top - S(kHeaderIcon)) / 2;
         p.target->DrawBitmap(icon, D2D1::RectF(header.left, top, header.left + S(kHeaderIcon), top + S(kHeaderIcon)),
                              1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
@@ -368,8 +370,8 @@ void DrawNowPlaying(const MediaInfo& m, ID2D1SolidColorBrush* paint) {
     // widget's small copy stands in rather than an empty square.
     const auto art = ArtRect();
     const float radius = S(kArtRadius);
-    ID2D1Bitmap* cover = Uploaded(m.largeArt.get(), p.largeArt, p.largeArtSource);
-    if (!cover) cover = Uploaded(m.art.get(), p.smallArt, p.smallArtSource);
+    ID2D1Bitmap* cover = Uploaded(m.largeArt, p.largeArt, p.largeArtSource);
+    if (!cover) cover = Uploaded(m.art, p.smallArt, p.smallArtSource);
     if (cover) {
         FillWithImage(cover, art, radius);
     } else {
@@ -455,13 +457,13 @@ void DrawNowPlaying(const MediaInfo& m, ID2D1SolidColorBrush* paint) {
 }
 
 // A cover for the list, uploaded once per image and reused while it stays.
-ID2D1Bitmap* RowArt(const MediaArt* image) {
+ID2D1Bitmap* RowArt(const std::shared_ptr<const MediaArt>& image) {
     if (!image) return nullptr;
     for (auto& [source, bitmap] : p.rowArt) {
         if (source == image) return bitmap.Get();
     }
     ComPtr<ID2D1Bitmap> bitmap;
-    const MediaArt* uploadedFrom = nullptr;
+    std::shared_ptr<const MediaArt> uploadedFrom;
     Uploaded(image, bitmap, uploadedFrom);
     p.rowArt.emplace_back(image, bitmap);
     return bitmap.Get();
@@ -475,7 +477,7 @@ void DrawAppList(const MediaInfo& m, ID2D1SolidColorBrush* paint) {
     // Forget covers no longer listed, so they don't pile up while open.
     std::erase_if(p.rowArt, [&](const auto& entry) {
         return std::none_of(m.sessions.begin(), m.sessions.end(),
-                            [&](const SessionSummary& s) { return s.art.get() == entry.first; });
+                            [&](const SessionSummary& s) { return s.art == entry.first; });
     });
 
     paint->SetColor(Ink(0.08f));
@@ -498,7 +500,7 @@ void DrawAppList(const MediaInfo& m, ID2D1SolidColorBrush* paint) {
 
         const float artLeft = row.left + S(8), artTop = row.top + (row.bottom - row.top - S(kRowArt)) / 2;
         const auto art = D2D1::RectF(artLeft, artTop, artLeft + S(kRowArt), artTop + S(kRowArt));
-        if (ID2D1Bitmap* cover = RowArt(s.art.get())) {
+        if (ID2D1Bitmap* cover = RowArt(s.art)) {
             FillWithImage(cover, art, S(4));
         } else {
             paint->SetColor(Ink(0.08f));

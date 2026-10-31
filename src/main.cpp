@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <memory>
 #include <vector>
 #include "app_info.h"
 #include "media_watcher.h"
@@ -165,9 +166,9 @@ struct State {
     ComPtr<IDWriteTextFormat> smallIconFormat; // the switch chevron
     UINT textFormatDpi = 0;
     ComPtr<ID2D1Bitmap> artBitmap;           // nowPlaying.art, uploaded for drawing
-    const MediaArt* artBitmapSource = nullptr;
+    std::shared_ptr<const MediaArt> artBitmapSource;
     ComPtr<ID2D1Bitmap> iconBitmap;          // nowPlaying.appIcon, uploaded for drawing
-    const MediaArt* iconBitmapSource = nullptr;
+    std::shared_ptr<const MediaArt> iconBitmapSource;
 
     int hovered = kNoButton;
     int pressed = kNoButton;
@@ -406,7 +407,10 @@ int HitButton(POINT pt) {
 }
 
 // Uploads an image to a Direct2D bitmap once, when it changes (new track or app).
-ID2D1Bitmap* Uploaded(const MediaArt* image, ComPtr<ID2D1Bitmap>& bitmap, const MediaArt*& uploadedFrom) {
+// uploadedFrom keeps the image alive: a freed image's address could be reused by
+// the next cover, which would then look unchanged.
+ID2D1Bitmap* Uploaded(const std::shared_ptr<const MediaArt>& image, ComPtr<ID2D1Bitmap>& bitmap,
+                      std::shared_ptr<const MediaArt>& uploadedFrom) {
     if (image != uploadedFrom) {
         bitmap.Reset();
         uploadedFrom = image;
@@ -420,8 +424,8 @@ ID2D1Bitmap* Uploaded(const MediaArt* image, ComPtr<ID2D1Bitmap>& bitmap, const 
     return bitmap.Get();
 }
 
-ID2D1Bitmap* ArtBitmap() { return Uploaded(g.nowPlaying.art.get(), g.artBitmap, g.artBitmapSource); }
-ID2D1Bitmap* IconBitmap() { return Uploaded(g.nowPlaying.appIcon.get(), g.iconBitmap, g.iconBitmapSource); }
+ID2D1Bitmap* ArtBitmap() { return Uploaded(g.nowPlaying.art, g.artBitmap, g.artBitmapSource); }
+ID2D1Bitmap* IconBitmap() { return Uploaded(g.nowPlaying.appIcon, g.iconBitmap, g.iconBitmapSource); }
 
 D2D1_COLOR_F InkAt(float alpha) {
     return g.lightTheme ? D2D1::ColorF(0, 0, 0, alpha) : D2D1::ColorF(1, 1, 1, alpha);
