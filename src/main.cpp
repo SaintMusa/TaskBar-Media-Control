@@ -1533,6 +1533,10 @@ LRESULT CALLBACK ControllerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         ApplyGeometry();
         return 0;
     case WM_APP_MEDIA:
+        if (wp) {
+            Log(L"Media error 0x%08lX; the media thread carries on", static_cast<unsigned long>(lp));
+            return 0;
+        }
         OnMediaChanged();
         return 0;
     case WM_TIMER:

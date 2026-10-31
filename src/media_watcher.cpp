@@ -31,6 +31,7 @@ namespace {
 // Apps often fire several updates per track change (title, then artist, then
 // playback state). Waiting this long after the last one evaluates them once.
 constexpr DWORD kCoalesceMs = 50;
+constexpr DWORD kRetryAfterErrorMs = 1000;
 
 struct Tracked {
     Session session{nullptr};
@@ -348,6 +349,10 @@ void MediaWatcher::SwitchSession(int direction) {
 
 void MediaWatcher::Run() {
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    // wParam 1 tells the UI thread this is an error for its log, not new media.
+    auto reportError = [this](const winrt::hresult_error& error) {
+        PostMessageW(notifyWnd_, changedMsg_, 1, static_cast<LPARAM>(static_cast<uint32_t>(error.code().value)));
+    };
     try {
         ComPtr<IWICImagingFactory> wic;
         CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic));
@@ -378,34 +383,240 @@ void MediaWatcher::Run() {
 
         HANDLE waits[] = {stopEvent_, wakeEvent_};
         while (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
-            // A click or scroll should feel instant; only plain updates wait for the burst to settle.
-            if (pendingCommand_ == 0 && pendingSwitch_ == 0 && pendingSeekMs_ < 0) {
-                while (WaitForSingleObject(wakeEvent_, kCoalesceMs) == WAIT_OBJECT_0) {
+            try {
+                // A click or scroll should feel instant; only plain updates wait for the burst to settle.
+                if (pendingCommand_ == 0 && pendingSwitch_ == 0 && pendingSeekMs_ < 0) {
+                    while (WaitForSingleObject(wakeEvent_, kCoalesceMs) == WAIT_OBJECT_0) {
+                    }
                 }
-            }
-            if (WaitForSingleObject(stopEvent_, 0) == WAIT_OBJECT_0) break;
-            ++evaluations_;
+                if (WaitForSingleObject(stopEvent_, 0) == WAIT_OBJECT_0) break;
+                ++evaluations_;
 
-            if (auto command = static_cast<MediaCommand>(pendingCommand_.exchange(0));
-                command != MediaCommand::None && shown) {
-                RunCommand(shown, command); // the app's update event re-wakes us with the new state
-                continue;
-            }
-            if (const int64_t seekMs = pendingSeekMs_.exchange(-1); seekMs >= 0 && shown) {
-                try {
-                    const int64_t ticks = (Latest().startMs + seekMs) * 10000; // the API counts 100 ns units
-                    shown.TryChangePlaybackPositionAsync(ticks).get();
-                } catch (...) {
+                if (auto command = static_cast<MediaCommand>(pendingCommand_.exchange(0));
+                    command != MediaCommand::None && shown) {
+                    RunCommand(shown, command); // the app's update event re-wakes us with the new state
+                    continue;
                 }
-                continue; // the app reports its new timeline, which wakes us
-            }
+                if (const int64_t seekMs = pendingSeekMs_.exchange(-1); seekMs >= 0 && shown) {
+                    try {
+                        const int64_t ticks = (Latest().startMs + seekMs) * 10000; // the API counts 100 ns units
+                        shown.TryChangePlaybackPositionAsync(ticks).get();
+                    } catch (...) {
+                    }
+                    continue; // the app reports its new timeline, which wakes us
+                }
 
-            if (!needsFullEvaluation_.exchange(false) && shown) {
-                ++timelineOnly_;
-                MediaInfo info = Latest();
-                info.hasTimeline = false;
-                info.durationMs = info.positionMs = info.reportedAt = 0;
-                ReadTimeline(shown, info);
+                if (!needsFullEvaluation_.exchange(false) && shown) {
+                    ++timelineOnly_;
+                    MediaInfo info = Latest();
+                    info.hasTimeline = false;
+                    info.durationMs = info.positionMs = info.reportedAt = 0;
+                    ReadTimeline(shown, info);
+                    bool changed;
+                    {
+                        std::lock_guard lock(mutex_);
+                        changed = !(info == latest_);
+                        latest_ = std::move(info);
+                    }
+                    if (changed) PostMessageW(notifyWnd_, changedMsg_, 0, 0);
+                    continue;
+                }
+
+                AppFilter filter;
+                {
+                    std::lock_guard lock(mutex_);
+                    filter = filter_;
+                }
+
+                // Keep one subscription per live session; drop the ones that closed
+                // and the ones the user chose to ignore.
+                std::vector<Tracked> next;
+                for (const auto& session : manager.GetSessions()) {
+                    auto it = std::find_if(tracked.begin(), tracked.end(),
+                                           [&](const Tracked& t) { return t.session == session; });
+                    if (it != tracked.end()) {
+                        if (filter.Ignores(it->appId, it->appName)) continue;
+                        it->isMusic = filter.IsMusicApp(it->appId, it->appName);
+                        it->isBrowser = filter.IsBrowser(it->appId, it->appName);
+                        next.push_back(std::move(*it));
+                        continue;
+                    }
+                    Tracked t;
+                    t.session = session;
+                    try {
+                        t.appId = session.SourceAppUserModelId();
+                        t.appName = nameOf(t.appId);
+                        if (filter.Ignores(t.appId, t.appName)) continue;
+                        t.isMusic = filter.IsMusicApp(t.appId, t.appName);
+                        t.isBrowser = filter.IsBrowser(t.appId, t.appName);
+                        t.propertiesChanged = session.MediaPropertiesChanged(
+                            winrt::auto_revoke, [this, stale = t.propertiesStale](auto&&, auto&&) {
+                                *stale = true;
+                                needsFullEvaluation_ = true;
+                                SetEvent(wakeEvent_);
+                            });
+                        t.playbackChanged = session.PlaybackInfoChanged(winrt::auto_revoke, wake);
+                        t.timelineChanged = session.TimelinePropertiesChanged(
+                            winrt::auto_revoke, [this, shownFlag = t.isShown](auto&&, auto&&) {
+                                if (*shownFlag) SetEvent(wakeEvent_);
+                            });
+                    } catch (const winrt::hresult_error& error) {
+                        // This app is on its way out. Leave it, and keep the others intact.
+                        reportError(error);
+                        continue;
+                    }
+                    next.push_back(std::move(t));
+                }
+                tracked = std::move(next);
+
+                // Scrolling steps through sessions in a stable order, wrapping around.
+                if (int steps = pendingSwitch_.exchange(0); steps != 0 && tracked.size() > 1) {
+                    auto it = std::find_if(tracked.begin(), tracked.end(),
+                                           [&](const Tracked& t) { return shown && t.session == shown; });
+                    const int count = static_cast<int>(tracked.size());
+                    const int from = it == tracked.end() ? 0 : static_cast<int>(it - tracked.begin());
+                    picked = tracked[((from + steps) % count + count) % count].session;
+                    pickedAt = playCounter;
+                }
+                // Or a specific app chosen from the menu.
+                std::wstring pickApp;
+                {
+                    std::lock_guard lock(mutex_);
+                    pickApp = std::exchange(pendingPick_, std::wstring{});
+                }
+                for (const auto& t : tracked) {
+                    if (!pickApp.empty() && t.appId == pickApp) {
+                        picked = t.session;
+                        pickedAt = playCounter;
+                    }
+                }
+
+                // Among playing apps: a music app first (if preferred), then a
+                // non-browser (if preferred), then whichever started playing last.
+                Tracked* best = nullptr;
+                Tracked* pick = nullptr;
+                uint64_t newestStart = 0;
+                auto rank = [&](const Tracked& t) {
+                    return std::make_tuple(filter.preferMusicApps && t.isMusic, filter.preferNonBrowsers && !t.isBrowser,
+                                           t.playingSince);
+                };
+                for (auto& t : tracked) {
+                    bool wasPlaying = t.wasPlaying;
+                    ReadPlayback(t);
+                    if (t.wasPlaying && !wasPlaying) t.playingSince = ++playCounter;
+                    if (t.wasPlaying && (!best || rank(t) > rank(*best))) best = &t;
+                    if (t.wasPlaying) newestStart = std::max(newestStart, t.playingSince);
+                    if (picked && t.session == picked) pick = &t;
+                }
+                // A pinned app beats all of the above whenever it's open. Switching
+                // away from it still works and stays, playing or paused, until you
+                // switch again, that app closes, or the pinned app starts playing.
+                Tracked* pinned = nullptr;
+                for (auto& t : tracked) {
+                    if (filter.IsPinned(t.appId, t.appName)) pinned = &t;
+                }
+                if (pinned) {
+                    const bool swapHolds = pick && pick != pinned && pinned->playingSince <= pickedAt;
+                    best = swapHolds ? pick : pinned;
+                    if (!swapHolds) picked = nullptr;
+                } else if (pick && newestStart <= pickedAt) {
+                    best = pick;
+                } else {
+                    picked = nullptr;
+                }
+                // Nothing playing: keep showing what we showed, paused.
+                for (auto& t : tracked) {
+                    if (!best && t.appId == shownAppId) best = &t;
+                }
+                if (!best && !tracked.empty()) {
+                    auto current = manager.GetCurrentSession();
+                    for (auto& t : tracked) {
+                        if (current && t.session == current) best = &t;
+                    }
+                    if (!best) best = &tracked.front();
+                }
+
+                MediaInfo info;
+                if (best) {
+                    // The big cover is decoded only while the pop-up is open, and
+                    // dropped (memory freed) as soon as it closes.
+                    const UINT largeSize = largeArtSize_;
+                    for (auto& t : tracked) {
+                        if (!largeSize || &t != best) t.largeArt.reset();
+                    }
+                    const bool stale = best->propertiesStale->exchange(false);
+                    const bool needsLarge = largeSize && (!best->largeArt || best->largeArt->size != largeSize);
+                    if (stale || needsLarge) {
+                        try {
+                            if (auto props = best->session.TryGetMediaPropertiesAsync().get()) {
+                                if (stale) {
+                                    best->title = props.Title();
+                                    best->artist = props.Artist();
+                                    best->art = DecodeThumbnail(wic.Get(), props.Thumbnail(), artSize_);
+                                    best->hasAccent =
+                                        best->art && FindAccent(*best->art, best->accentHue, best->accentSaturation);
+                                }
+                                if (largeSize) best->largeArt = DecodeThumbnail(wic.Get(), props.Thumbnail(), largeSize);
+                            }
+                        } catch (...) {
+                            // The app closed mid-query; the next SessionsChanged sorts it out.
+                        }
+                    }
+                    info.appId = best->appId;
+                    info.title = best->title;
+                    info.artist = best->artist;
+                    info.art = best->art;
+                    info.largeArt = best->largeArt;
+                    info.hasAccent = best->hasAccent;
+                    info.accentHue = best->accentHue;
+                    info.accentSaturation = best->accentSaturation;
+                    const UINT iconSize = std::max(12u, artSize_ * 7 / 16); // a badge, under half the art
+                    auto key = std::make_pair(best->appId, iconSize);
+                    auto icon = appIcons.find(key);
+                    if (icon == appIcons.end()) {
+                        icon = appIcons.emplace(key, LoadAppIcon(wic.Get(), best->appId, iconSize)).first;
+                    }
+                    info.appIcon = icon->second;
+                    info.appName = best->appName;
+                    info.playing = best->wasPlaying;
+                    info.canPrevious = best->canPrevious;
+                    info.canPlayPause = best->canPlayPause;
+                    info.canNext = best->canNext;
+                    info.rate = best->rate;
+                    info.sessionCount = static_cast<int>(tracked.size());
+                    info.canShuffle = best->canShuffle;
+                    info.shuffle = best->shuffle;
+                    info.canRepeat = best->canRepeat;
+                    info.canSeek = best->canSeek;
+                    info.repeat = best->repeat;
+                    // While the pop-up is open it lists every app, so fill in the ones
+                    // never shown yet (once each; later changes mark them stale again).
+                    if (largeSize) {
+                        for (auto& t : tracked) {
+                            if (&t == best || !t.propertiesStale->exchange(false)) continue;
+                            try {
+                                if (auto props = t.session.TryGetMediaPropertiesAsync().get()) {
+                                    t.title = props.Title();
+                                    t.artist = props.Artist();
+                                    t.art = DecodeThumbnail(wic.Get(), props.Thumbnail(), artSize_);
+                                    t.hasAccent = t.art && FindAccent(*t.art, t.accentHue, t.accentSaturation);
+                                }
+                            } catch (...) {
+                            }
+                        }
+                    }
+                    for (const auto& t : tracked) {
+                        info.sessions.push_back({t.appId, t.appName, t.title, t.artist, t.art, t.wasPlaying});
+                    }
+                    ReadTimeline(best->session, info);
+                    shownAppId = best->appId;
+                    shown = best->session;
+                } else {
+                    shownAppId.clear();
+                    shown = nullptr;
+                }
+                for (auto& t : tracked) *t.isShown = &t == best;
+
                 bool changed;
                 {
                     std::lock_guard lock(mutex_);
@@ -413,208 +624,18 @@ void MediaWatcher::Run() {
                     latest_ = std::move(info);
                 }
                 if (changed) PostMessageW(notifyWnd_, changedMsg_, 0, 0);
-                continue;
+            } catch (const winrt::hresult_error& error) {
+                // Any call into an app can fail if it exits at that moment. Windows may
+                // send nothing more about it, so look again after a pause.
+                reportError(error);
+                needsFullEvaluation_ = true;
+                if (WaitForSingleObject(stopEvent_, kRetryAfterErrorMs) == WAIT_OBJECT_0) break;
+                SetEvent(wakeEvent_);
             }
-
-            AppFilter filter;
-            {
-                std::lock_guard lock(mutex_);
-                filter = filter_;
-            }
-
-            // Keep one subscription per live session; drop the ones that closed
-            // and the ones the user chose to ignore.
-            std::vector<Tracked> next;
-            for (const auto& session : manager.GetSessions()) {
-                auto it = std::find_if(tracked.begin(), tracked.end(),
-                                       [&](const Tracked& t) { return t.session == session; });
-                if (it != tracked.end()) {
-                    if (filter.Ignores(it->appId, it->appName)) continue;
-                    it->isMusic = filter.IsMusicApp(it->appId, it->appName);
-                    it->isBrowser = filter.IsBrowser(it->appId, it->appName);
-                    next.push_back(std::move(*it));
-                    continue;
-                }
-                Tracked t;
-                t.session = session;
-                t.appId = session.SourceAppUserModelId();
-                t.appName = nameOf(t.appId);
-                if (filter.Ignores(t.appId, t.appName)) continue;
-                t.isMusic = filter.IsMusicApp(t.appId, t.appName);
-                t.isBrowser = filter.IsBrowser(t.appId, t.appName);
-                t.propertiesChanged = session.MediaPropertiesChanged(
-                    winrt::auto_revoke, [this, stale = t.propertiesStale](auto&&, auto&&) {
-                        *stale = true;
-                        needsFullEvaluation_ = true;
-                        SetEvent(wakeEvent_);
-                    });
-                t.playbackChanged = session.PlaybackInfoChanged(winrt::auto_revoke, wake);
-                t.timelineChanged = session.TimelinePropertiesChanged(
-                    winrt::auto_revoke, [this, shownFlag = t.isShown](auto&&, auto&&) {
-                        if (*shownFlag) SetEvent(wakeEvent_);
-                    });
-                next.push_back(std::move(t));
-            }
-            tracked = std::move(next);
-
-            // Scrolling steps through sessions in a stable order, wrapping around.
-            if (int steps = pendingSwitch_.exchange(0); steps != 0 && tracked.size() > 1) {
-                auto it = std::find_if(tracked.begin(), tracked.end(),
-                                       [&](const Tracked& t) { return shown && t.session == shown; });
-                const int count = static_cast<int>(tracked.size());
-                const int from = it == tracked.end() ? 0 : static_cast<int>(it - tracked.begin());
-                picked = tracked[((from + steps) % count + count) % count].session;
-                pickedAt = playCounter;
-            }
-            // Or a specific app chosen from the menu.
-            std::wstring pickApp;
-            {
-                std::lock_guard lock(mutex_);
-                pickApp = std::exchange(pendingPick_, std::wstring{});
-            }
-            for (const auto& t : tracked) {
-                if (!pickApp.empty() && t.appId == pickApp) {
-                    picked = t.session;
-                    pickedAt = playCounter;
-                }
-            }
-
-            // Among playing apps: a music app first (if preferred), then a
-            // non-browser (if preferred), then whichever started playing last.
-            Tracked* best = nullptr;
-            Tracked* pick = nullptr;
-            uint64_t newestStart = 0;
-            auto rank = [&](const Tracked& t) {
-                return std::make_tuple(filter.preferMusicApps && t.isMusic, filter.preferNonBrowsers && !t.isBrowser,
-                                       t.playingSince);
-            };
-            for (auto& t : tracked) {
-                bool wasPlaying = t.wasPlaying;
-                ReadPlayback(t);
-                if (t.wasPlaying && !wasPlaying) t.playingSince = ++playCounter;
-                if (t.wasPlaying && (!best || rank(t) > rank(*best))) best = &t;
-                if (t.wasPlaying) newestStart = std::max(newestStart, t.playingSince);
-                if (picked && t.session == picked) pick = &t;
-            }
-            // A pinned app beats all of the above whenever it's open. Switching
-            // away from it still works and stays, playing or paused, until you
-            // switch again, that app closes, or the pinned app starts playing.
-            Tracked* pinned = nullptr;
-            for (auto& t : tracked) {
-                if (filter.IsPinned(t.appId, t.appName)) pinned = &t;
-            }
-            if (pinned) {
-                const bool swapHolds = pick && pick != pinned && pinned->playingSince <= pickedAt;
-                best = swapHolds ? pick : pinned;
-                if (!swapHolds) picked = nullptr;
-            } else if (pick && newestStart <= pickedAt) {
-                best = pick;
-            } else {
-                picked = nullptr;
-            }
-            // Nothing playing: keep showing what we showed, paused.
-            for (auto& t : tracked) {
-                if (!best && t.appId == shownAppId) best = &t;
-            }
-            if (!best && !tracked.empty()) {
-                auto current = manager.GetCurrentSession();
-                for (auto& t : tracked) {
-                    if (current && t.session == current) best = &t;
-                }
-                if (!best) best = &tracked.front();
-            }
-
-            MediaInfo info;
-            if (best) {
-                // The big cover is decoded only while the pop-up is open, and
-                // dropped (memory freed) as soon as it closes.
-                const UINT largeSize = largeArtSize_;
-                for (auto& t : tracked) {
-                    if (!largeSize || &t != best) t.largeArt.reset();
-                }
-                const bool stale = best->propertiesStale->exchange(false);
-                const bool needsLarge = largeSize && (!best->largeArt || best->largeArt->size != largeSize);
-                if (stale || needsLarge) {
-                    try {
-                        if (auto props = best->session.TryGetMediaPropertiesAsync().get()) {
-                            if (stale) {
-                                best->title = props.Title();
-                                best->artist = props.Artist();
-                                best->art = DecodeThumbnail(wic.Get(), props.Thumbnail(), artSize_);
-                                best->hasAccent =
-                                    best->art && FindAccent(*best->art, best->accentHue, best->accentSaturation);
-                            }
-                            if (largeSize) best->largeArt = DecodeThumbnail(wic.Get(), props.Thumbnail(), largeSize);
-                        }
-                    } catch (...) {
-                        // The app closed mid-query; the next SessionsChanged sorts it out.
-                    }
-                }
-                info.appId = best->appId;
-                info.title = best->title;
-                info.artist = best->artist;
-                info.art = best->art;
-                info.largeArt = best->largeArt;
-                info.hasAccent = best->hasAccent;
-                info.accentHue = best->accentHue;
-                info.accentSaturation = best->accentSaturation;
-                const UINT iconSize = std::max(12u, artSize_ * 7 / 16); // a badge, under half the art
-                auto key = std::make_pair(best->appId, iconSize);
-                auto icon = appIcons.find(key);
-                if (icon == appIcons.end()) {
-                    icon = appIcons.emplace(key, LoadAppIcon(wic.Get(), best->appId, iconSize)).first;
-                }
-                info.appIcon = icon->second;
-                info.appName = best->appName;
-                info.playing = best->wasPlaying;
-                info.canPrevious = best->canPrevious;
-                info.canPlayPause = best->canPlayPause;
-                info.canNext = best->canNext;
-                info.rate = best->rate;
-                info.sessionCount = static_cast<int>(tracked.size());
-                info.canShuffle = best->canShuffle;
-                info.shuffle = best->shuffle;
-                info.canRepeat = best->canRepeat;
-                info.canSeek = best->canSeek;
-                info.repeat = best->repeat;
-                // While the pop-up is open it lists every app, so fill in the ones
-                // never shown yet (once each; later changes mark them stale again).
-                if (largeSize) {
-                    for (auto& t : tracked) {
-                        if (&t == best || !t.propertiesStale->exchange(false)) continue;
-                        try {
-                            if (auto props = t.session.TryGetMediaPropertiesAsync().get()) {
-                                t.title = props.Title();
-                                t.artist = props.Artist();
-                                t.art = DecodeThumbnail(wic.Get(), props.Thumbnail(), artSize_);
-                                t.hasAccent = t.art && FindAccent(*t.art, t.accentHue, t.accentSaturation);
-                            }
-                        } catch (...) {
-                        }
-                    }
-                }
-                for (const auto& t : tracked) {
-                    info.sessions.push_back({t.appId, t.appName, t.title, t.artist, t.art, t.wasPlaying});
-                }
-                ReadTimeline(best->session, info);
-                shownAppId = best->appId;
-                shown = best->session;
-            } else {
-                shownAppId.clear();
-                shown = nullptr;
-            }
-            for (auto& t : tracked) *t.isShown = &t == best;
-
-            bool changed;
-            {
-                std::lock_guard lock(mutex_);
-                changed = !(info == latest_);
-                latest_ = std::move(info);
-            }
-            if (changed) PostMessageW(notifyWnd_, changedMsg_, 0, 0);
         }
-    } catch (const winrt::hresult_error&) {
+    } catch (const winrt::hresult_error& error) {
         // Media sessions unavailable; the widget just shows nothing.
+        reportError(error);
     }
     winrt::uninit_apartment();
 }
