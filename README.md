@@ -25,7 +25,8 @@ browsers (YouTube, Twitch) and media players.
 - Pin an app to keep it on the widget while others play; switching away still works
 - Hide apps you never want to see, or make browsers show only when nothing else plays
 - Hides itself when nothing is playing, or after a while paused (or stays, if you prefer)
-- Right-click menu with shuffle, repeat, switching and all options
+- Settings window (the pop-up's gear, or right-click > **Settings...**) for every option, including picking hotkeys by pressing them
+- Right-click menu with shuffle, repeat, switching and the common options
 - Optional start with Windows
 - Follows the system light/dark theme
 - Comes back by itself if Explorer restarts
@@ -65,13 +66,15 @@ ctest --test-dir build --output-on-failure
   One scroll gesture switches one app.
 - Ctrl + scroll to change that app's volume, Shift + scroll to seek.
 - Rest the mouse on the widget to see the full title.
-- Right-click for shuffle, repeat, switching, hiding apps, **Start with
-  Windows** and **Exit TaskbarMedia**.
+- Right-click for shuffle, repeat, switching, hiding apps, **Settings...** and
+  **Exit TaskbarMedia**.
 
 ## Settings
 
-Settings are in `settings.ini` next to `TaskbarMedia.exe` (right-click >
-**Open settings file**). If that folder can't be written to, for example in
+Everything below can be changed in the settings window, which saves as you go.
+They are kept in `settings.ini` next to `TaskbarMedia.exe` (right-click >
+**Open settings file**), if you prefer editing by hand; the window follows
+those edits while it's open. If that folder can't be written to, for example in
 Program Files, they go to `%APPDATA%\TaskbarMedia\settings.ini` instead. Every
 setting has a comment, and changes apply as soon as you save the file.
 
@@ -94,6 +97,9 @@ is injected into Explorer and no system files are changed.
 | File | What it does |
 |---|---|
 | `src/main.cpp` | The widget window, layout, drawing (Direct2D in software mode), menu and tooltip. A hidden window listens for Windows broadcasts such as Explorer restarts and theme changes. |
+| `src/settings_window.*` | The settings window: three pages drawn with Direct2D, with Windows' own text boxes for typing. It saves through the same `settings.*` code as the menu. |
+| `src/hotkey.*` | Reading and writing hotkeys such as `Ctrl+Alt+Up`, for the settings file and the window's key capture. |
+| `src/list_text.*` | The `;`-separated lists in `settings.ini`. |
 | `src/popup.*` | The pop-up player: its own window with Windows 11 acrylic, created on open and destroyed on close. |
 | `src/taskbar_watcher.*` | Finds the Start and Widgets buttons, the whole icon strip and the system tray with UI Automation, on its own thread, to know where the free space is. |
 | `src/placement.*` | Decides which side of the icons the widget goes on and how wide it is, from plain numbers, so `tests/` can check it. |

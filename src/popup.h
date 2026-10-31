@@ -23,7 +23,7 @@ struct PopupHost {
     std::function<void(int64_t positionMs)> seek; // from the start of the track
     std::function<void()> openApp;
     std::function<void(const std::wstring& appId)> pick; // show this app instead
-    std::function<void()> options;            // the gear: show the options menu
+    std::function<void()> options;            // the gear: open the settings window
     std::function<void()> closed;             // the pop-up has just closed
 };
 

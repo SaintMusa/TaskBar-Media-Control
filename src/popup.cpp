@@ -532,7 +532,7 @@ void DrawAppList(const MediaInfo& m, ID2D1SolidColorBrush* paint) {
     }
 }
 
-// The footer: a gear for the options menu, until there's a settings window.
+// The footer: a gear that opens the settings window.
 void DrawFooter(const MediaInfo& m, ID2D1SolidColorBrush* paint) {
     const float top = S(static_cast<float>(FooterTop(m)));
     paint->SetColor(Ink(0.08f));
@@ -672,7 +672,7 @@ void Activate(Hit hit) {
     case Hit::Previous: p.host.send(MediaCommand::Previous); break;
     case Hit::PlayPause: p.host.send(MediaCommand::PlayPause); break;
     case Hit::Next: p.host.send(MediaCommand::Next); break;
-    case Hit::Options: p.host.options(); break; // the menu taking focus closes the pop-up
+    case Hit::Options: p.host.options(); break; // the window taking focus closes the pop-up
     case Hit::Repeat: // off -> all -> one -> off, like most players
         p.host.send(m.repeat == RepeatMode::Off   ? MediaCommand::RepeatAll
                     : m.repeat == RepeatMode::All ? MediaCommand::RepeatOne

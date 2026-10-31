@@ -27,6 +27,7 @@
 #include "placement.h"
 #include "popup.h"
 #include "settings.h"
+#include "settings_window.h"
 #include "taskbar_watcher.h"
 #include "volume.h"
 
@@ -70,6 +71,7 @@ enum : UINT {
     kCmdStayVisible,
     kCmdStartWithWindows,
     kCmdOpenSettings,
+    kCmdSettings,
     kCmdSwitchFirst = 1000,   // + index into MediaInfo::sessions
     kCmdUnignoreFirst = 2000, // + index into Settings::ignoredApps
 };
@@ -1118,6 +1120,10 @@ void OnMediaChanged() {
 
 enum : int { kHotkeyPlayPause = 1, kHotkeyNext, kHotkeyPrevious, kHotkeySwitchApp };
 
+void UnregisterHotkeys() {
+    for (int id : {kHotkeyPlayPause, kHotkeyNext, kHotkeyPrevious, kHotkeySwitchApp}) UnregisterHotKey(g.controller, id);
+}
+
 void RegisterHotkeys() {
     const std::pair<int, const std::wstring*> hotkeys[] = {
         {kHotkeyPlayPause, &g.settings.hotkeyPlayPause},
@@ -1174,10 +1180,30 @@ void ApplySettings(const Settings& next) {
         SetTimer(g.controller, kTimerIdleHide, g.settings.hideAfterPausedSeconds * 1000, nullptr);
     }
     UpdateVisibility();
+    SettingsWindowRefresh(); // an edit of the file shows in the window too
 }
 
 void OpenSettingsFile() {
     ShellExecuteW(nullptr, L"open", L"notepad.exe", (L"\"" + SettingsPath() + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
+}
+
+void OpenSettings() {
+    SettingsHost host;
+    host.get = [] { return g.settings; };
+    host.apply = [](const Settings& next) {
+        SaveSettings(next);
+        ApplySettings(next);
+    };
+    host.lightTheme = [] { return g.lightTheme; };
+    host.openFile = [] { OpenSettingsFile(); };
+    host.pauseHotkeys = [](bool paused) {
+        if (paused) {
+            UnregisterHotkeys();
+        } else {
+            RegisterHotkeys();
+        }
+    };
+    OpenSettingsWindow(g.instance, g.dpi, std::move(host));
 }
 
 // Clicking the widget opens the pop-up player above it, or closes it. A click
@@ -1206,7 +1232,7 @@ void TogglePopup() {
     host.seek = [](int64_t positionMs) { SeekToMs(positionMs); };
     host.openApp = [] { ActivateApp(g.nowPlaying.appId); };
     host.pick = [](const std::wstring& appId) { g.media.ShowSession(appId); };
-    host.options = [] { ShowMenu(); };
+    host.options = [] { OpenSettings(); };
     host.closed = [] {
         g.media.SetLargeArtSize(0); // the big cover isn't kept around
         Render();                   // drop the widget's "open" look
@@ -1402,6 +1428,7 @@ void ShowMenu() {
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, checked(g.settings.stayVisibleWhenPaused), kCmdStayVisible, L"Stay visible when paused");
     AppendMenuW(menu, checked(StartsWithWindows()), kCmdStartWithWindows, L"Start with Windows");
+    AppendMenuW(menu, MF_STRING, kCmdSettings, L"Settings...");
     AppendMenuW(menu, MF_STRING, kCmdOpenSettings, L"Open settings file");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kCmdExit, L"Exit TaskbarMedia");
@@ -1436,6 +1463,7 @@ void ShowMenu() {
     case kCmdPreferNonBrowsers: ChangeSettings([](Settings& s) { s.preferNonBrowsers = !s.preferNonBrowsers; }); break;
     case kCmdStayVisible: ChangeSettings([](Settings& s) { s.stayVisibleWhenPaused = !s.stayVisibleWhenPaused; }); break;
     case kCmdStartWithWindows: SetStartWithWindows(!StartsWithWindows()); break;
+    case kCmdSettings: OpenSettings(); break;
     case kCmdOpenSettings: OpenSettingsFile(); break;
     case kCmdExit: DestroyWindow(g.controller); break;
     }
@@ -1630,6 +1658,7 @@ LRESULT CALLBACK ControllerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g.lightTheme = light;
                 Log(L"Theme changed: %s", light ? L"light" : L"dark");
                 ClosePopup(); // its backdrop and colors were set for the old theme
+                SettingsWindowRefresh();
                 Render();
             }
         }
@@ -1656,6 +1685,7 @@ LRESULT CALLBACK ControllerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             KillTimer(hwnd, timer);
         }
         ClosePopup();
+        CloseSettingsWindow();
         UnregisterAppBar();
         for (int id : {kHotkeyPlayPause, kHotkeyNext, kHotkeyPrevious, kHotkeySwitchApp}) UnregisterHotKey(hwnd, id);
         g.controller = nullptr;
