@@ -338,14 +338,25 @@ bool AppFilter::Ignores(const std::wstring& appId, const std::wstring& appName) 
 }
 
 namespace {
-bool AnyWithin(const std::vector<std::wstring>& parts, const std::wstring& appId, const std::wstring& appName) {
-    auto contains = [](const std::wstring& text, const std::wstring& part) {
-        return !part.empty() && std::search(text.begin(), text.end(), part.begin(), part.end(), [](wchar_t a, wchar_t b) {
-                                    return towlower(a) == towlower(b);
-                                }) != text.end();
+// A whole word, ignoring case, so "Arc" finds "Arc.exe" but not "Search".
+bool ContainsWord(const std::wstring& text, const std::wstring& word) {
+    if (word.empty()) return false;
+    auto next = [&](std::wstring::const_iterator from) {
+        return std::search(from, text.end(), word.begin(), word.end(),
+                           [](wchar_t a, wchar_t b) { return towlower(a) == towlower(b); });
     };
-    for (const auto& part : parts) {
-        if (contains(appId, part) || contains(appName, part)) return true;
+    for (auto found = next(text.begin()); found != text.end(); found = next(found + 1)) {
+        const auto end = found + word.size();
+        const bool startsWord = found == text.begin() || !iswalnum(*(found - 1));
+        const bool endsWord = end == text.end() || !iswalnum(*end);
+        if (startsWord && endsWord) return true;
+    }
+    return false;
+}
+
+bool AnyWithin(const std::vector<std::wstring>& words, const std::wstring& appId, const std::wstring& appName) {
+    for (const auto& word : words) {
+        if (ContainsWord(appId, word) || ContainsWord(appName, word)) return true;
     }
     return false;
 }

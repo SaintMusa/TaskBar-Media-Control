@@ -184,6 +184,7 @@ struct State {
     bool fullscreen = false; // a full screen app or game is in front
     bool idleHidden = false; // media has been paused for settings.hideAfterPausedSeconds
     bool noMediaPending = false; // the last app's media ended; kTimerNoMedia is running
+    bool filterJustChanged = false; // hiding an app is a choice, so it takes effect at once
     Settings settings;
 
     HDC memDC = nullptr;
@@ -723,6 +724,13 @@ void Present() {
     g.presentedBytes = static_cast<size_t>(size.cx) * size.cy * 4;
 }
 
+// Windows' "Animation effects" setting.
+bool AnimationsEnabled() {
+    BOOL enabled = TRUE;
+    SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &enabled, 0);
+    return enabled != FALSE;
+}
+
 void StopFade() {
     if (g.fading) KillTimer(g.controller, kTimerFade);
     g.fading = false;
@@ -777,7 +785,7 @@ void Render(Redraw what = Redraw::Full) {
         StopFade();
     }
     // The bitmap still holds what's on screen, which is where a fade starts from.
-    const bool startFade = g.fadeNext && what == Redraw::Full && g.presentedBytes == bytes;
+    const bool startFade = g.fadeNext && what == Redraw::Full && g.presentedBytes == bytes && AnimationsEnabled();
     g.fadeNext = false;
     if (startFade) g.fadeFrom.assign(bits, bits + bytes);
     if (what == Redraw::Marquee && g.basePixels.size() != bytes) what = Redraw::Seekbar;
@@ -1048,13 +1056,14 @@ void ApplyLatestMedia() {
 // vanishing in between, and the next track cross-fades in as usual.
 void OnMediaChanged() {
     const bool mediaEnded = g.media.Latest().appId.empty() && !g.nowPlaying.appId.empty();
-    if (mediaEnded) {
+    if (mediaEnded && !g.filterJustChanged) {
         if (!g.noMediaPending) {
             g.noMediaPending = true;
             SetTimer(g.controller, kTimerNoMedia, kNoMediaGraceMs, nullptr);
         }
         return;
     }
+    g.filterJustChanged = false;
     KillTimer(g.controller, kTimerNoMedia);
     g.noMediaPending = false;
     ApplyLatestMedia();
@@ -1147,7 +1156,10 @@ void ApplySettings(const Settings& next) {
                                 next.hotkeyPrevious != g.settings.hotkeyPrevious ||
                                 next.hotkeySwitchApp != g.settings.hotkeySwitchApp;
     g.settings = next;
-    if (filterChanged) g.media.SetFilter(FilterFrom(g.settings));
+    if (filterChanged) {
+        g.filterJustChanged = true;
+        g.media.SetFilter(FilterFrom(g.settings));
+    }
     if (hotkeysChanged) RegisterHotkeys();
     if (g.settings.stayVisibleWhenPaused) {
         KillTimer(g.controller, kTimerIdleHide);
@@ -1210,7 +1222,7 @@ void Flash(const std::wstring& text) {
 void ChangeVolume(int wheelDelta) {
     const std::wstring& appId = g.nowPlaying.appId;
     if (appId.empty()) return;
-    if (appId != g.volumeAppId) {
+    if (appId != g.volumeAppId || g.volumeExe.empty()) { // empty: no window to ask last time
         g.volumeAppId = appId;
         g.volumeExe = AppExeName(appId);
     }
@@ -1322,16 +1334,24 @@ template <typename Change> void ChangeSettings(Change change) {
     ApplySettings(next);
 }
 
+// Menus read "&" as "underline the next letter"; "&&" shows a real one.
+std::wstring MenuLabel(std::wstring text) {
+    for (size_t i = text.find(L'&'); i != std::wstring::npos; i = text.find(L'&', i + 2)) text.insert(i, 1, L'&');
+    return text;
+}
+
 // The right-click menu. Media items first (only what the app supports),
 // then which apps to show, then the app's own options.
 void ShowMenu() {
-    const MediaInfo& m = g.nowPlaying;
+    // A copy: the menu runs its own message loop, so g.nowPlaying can change while
+    // it's open, and what's chosen must match what was on the menu.
+    const MediaInfo m = g.nowPlaying;
     const std::wstring name = m.appName.empty() ? m.appId : m.appName;
     const auto checked = [](bool on) { return MF_STRING | (on ? MF_CHECKED : MF_UNCHECKED); };
     HMENU menu = CreatePopupMenu();
     HMENU switchTo = nullptr, repeat = nullptr, ignored = nullptr;
 
-    if (!m.appId.empty()) AppendMenuW(menu, MF_STRING, kCmdOpenApp, (L"Open " + name).c_str());
+    if (!m.appId.empty()) AppendMenuW(menu, MF_STRING, kCmdOpenApp, MenuLabel(L"Open " + name).c_str());
     if (m.sessions.size() > 1) {
         switchTo = CreatePopupMenu();
         for (size_t i = 0; i < m.sessions.size(); ++i) {
@@ -1339,7 +1359,7 @@ void ShowMenu() {
             std::wstring label = session.appName.empty() ? session.appId : session.appName;
             if (!session.title.empty()) label += L" — " + session.title;
             if (session.playing) label += L"  ▶";
-            AppendMenuW(switchTo, checked(session.appId == m.appId), kCmdSwitchFirst + i, label.c_str());
+            AppendMenuW(switchTo, checked(session.appId == m.appId), kCmdSwitchFirst + i, MenuLabel(label).c_str());
         }
         AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(switchTo), L"Switch to");
     }
@@ -1357,15 +1377,16 @@ void ShowMenu() {
     const bool shownIsPinned = !g.settings.pinnedApp.empty() &&
                                (_wcsicmp(g.settings.pinnedApp.c_str(), name.c_str()) == 0 ||
                                 _wcsicmp(g.settings.pinnedApp.c_str(), m.appId.c_str()) == 0);
-    if (!m.appId.empty()) AppendMenuW(menu, checked(shownIsPinned), kCmdPinApp, (L"Pin " + name).c_str());
+    if (!m.appId.empty()) AppendMenuW(menu, checked(shownIsPinned), kCmdPinApp, MenuLabel(L"Pin " + name).c_str());
     if (!g.settings.pinnedApp.empty() && !shownIsPinned) {
-        AppendMenuW(menu, MF_STRING, kCmdUnpin, (L"Unpin " + g.settings.pinnedApp).c_str());
+        AppendMenuW(menu, MF_STRING, kCmdUnpin, MenuLabel(L"Unpin " + g.settings.pinnedApp).c_str());
     }
-    if (!m.appId.empty()) AppendMenuW(menu, MF_STRING, kCmdIgnoreApp, (L"Never show " + name).c_str());
+    if (!m.appId.empty()) AppendMenuW(menu, MF_STRING, kCmdIgnoreApp, MenuLabel(L"Never show " + name).c_str());
     if (!g.settings.ignoredApps.empty()) {
         ignored = CreatePopupMenu();
         for (size_t i = 0; i < g.settings.ignoredApps.size(); ++i) {
-            AppendMenuW(ignored, MF_STRING, kCmdUnignoreFirst + i, (L"Show " + g.settings.ignoredApps[i] + L" again").c_str());
+            AppendMenuW(ignored, MF_STRING, kCmdUnignoreFirst + i,
+                        MenuLabel(L"Show " + g.settings.ignoredApps[i] + L" again").c_str());
         }
         AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(ignored), L"Hidden apps");
     }
